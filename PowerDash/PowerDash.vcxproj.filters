@@ -1,0 +1,168 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="源文件">
+      <UniqueIdentifier>{4FC737F1-C7A5-4376-A066-2A32D752A2FF}</UniqueIdentifier>
+      <Extensions>cpp;c;cc;cxx;c++;cppm;ixx;def;odl;idl;hpj;bat;asm;asmx</Extensions>
+    </Filter>
+    <Filter Include="头文件">
+      <UniqueIdentifier>{93995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
+      <Extensions>h;hh;hpp;hxx;h++;hm;inl;inc;ipp;xsd</Extensions>
+    </Filter>
+    <Filter Include="资源文件">
+      <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
+      <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav;mfcribbon-ms</Extensions>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="PowerDash.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="src\bw.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="src\cpucounters.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="src\debug.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="src\lspci.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="src\mmio.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="src\msr.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="src\pci.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="src\pcm-accel-common.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="src\pmt.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="src\resctrl.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="src\threadpool.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="src\topology.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="src\tpmi.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="src\uncore_pmu_discovery.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="src\utils.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="src\windows\dllmain.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="src\windows\stdafx.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="src\winpmem\winpmem.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="src\bw.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="src\cpucounters.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="src\dashboard.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="src\debug.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="src\favicon.ico.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="src\lspci.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="src\mmio.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="src\msr.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="src\mutex.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="src\pci.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="src\pcm-accel-common.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="src\pcm-iio-pmu.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="src\pcm-pcie.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="src\pmt.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="src\resctrl.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="src\threadpool.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="src\topology.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="src\topologyentry.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="src\tpmi.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="src\types.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="src\uncore_pmu_discovery.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="src\utils.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="src\version.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="src\width_extender.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="src\windows\PCMInstaller.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="src\windows\pcm-lib.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="src\windows\PCMService.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="src\windows\stdafx.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="src\windows\windriver.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="src\winpmem\winpmem.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+  </ItemGroup>
+</Project>

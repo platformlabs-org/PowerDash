@@ -1,0 +1,68 @@
+;
+; PowerDash.inf - Installation file for PowerDash Driver
+;
+
+[Version]
+Signature="$WINDOWS NT$"
+Class=System
+ClassGuid={4D36E97D-E325-11CE-BFC1-08002BE10318} ; System devices class
+Provider=%ManufacturerName%
+CatalogFile=PowerDash.cat
+DriverVer=05/07/2025,1.0.0.0
+
+[DestinationDirs]
+DefaultDestDir = 12  ; system32\drivers
+PowerDash_CoInstaller_CopyFiles = 11  ; system32
+
+[SourceDisksNames]
+1 = %DiskName%,,,
+
+[SourceDisksFiles]
+PowerDash.sys = 1,,
+WdfCoInstaller$KMDFCOINSTALLERVERSION$.dll = 1,,
+
+[Manufacturer]
+%ManufacturerName%=Standard,NT$ARCH$
+
+[Standard.NT$ARCH$]
+%PowerDash.DeviceDesc%=PowerDash_Install, Root\PowerDash
+
+[PowerDash_Install.NT]
+CopyFiles=Drivers_Dir
+
+[Drivers_Dir]
+PowerDash.sys
+
+[PowerDash_Install.NT.Services]
+AddService = powerdash, %SPSVCINST_ASSOCSERVICE%, PowerDash_Service_Inst
+
+[PowerDash_Service_Inst]
+DisplayName    = %PowerDash.SVCDESC%
+ServiceType    = 1 ; SERVICE_KERNEL_DRIVER
+StartType      = 3 ; SERVICE_DEMAND_START
+ErrorControl   = 1 ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %12%\PowerDash.sys
+
+; ------ KMDF CoInstaller installation ------
+[PowerDash_Install.NT.CoInstallers]
+AddReg = PowerDash_CoInstaller_AddReg
+CopyFiles = PowerDash_CoInstaller_CopyFiles
+
+[PowerDash_CoInstaller_AddReg]
+HKR,,CoInstallers32,0x00010000,"WdfCoInstaller$KMDFCOINSTALLERVERSION$.dll,WdfCoInstaller"
+
+[PowerDash_CoInstaller_CopyFiles]
+WdfCoInstaller$KMDFCOINSTALLERVERSION$.dll
+
+[PowerDash_Install.NT.Wdf]
+KmdfService = powerdash, PowerDash_WdfSection
+
+[PowerDash_WdfSection]
+KmdfLibraryVersion = $KMDFVERSION$
+
+[Strings]
+SPSVCINST_ASSOCSERVICE=0x00000002
+ManufacturerName="PowerDash Inc."
+DiskName="PowerDash Driver Installation Disk"
+PowerDash.DeviceDesc="PowerDash Device"
+PowerDash.SVCDESC="PowerDash Driver"

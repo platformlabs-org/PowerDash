@@ -142,11 +142,11 @@
     <FilesToPackage Include="$(TargetPath)" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="msr.h" />
-    <ClInclude Include="msrstruct.h" />
+    <ClInclude Include="powerdash.h" />
+    <ClInclude Include="pdstruct.h" />
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="msrmain.c" />
+    <ClCompile Include="powerdash.c" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

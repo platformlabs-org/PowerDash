@@ -1,19 +1,10 @@
-// SPDX-License-Identifier: BSD-3-Clause
-// Copyright (c) 2009-2022, Intel Corporation
-
-/*
-
-   WARNING: This driver code is only for testing purposes, not for production use
-*/
-
-#include "msr.h"
+#include "powerdash.h"
 #include "ntdef.h"
 #include <wdm.h>
 #include <wdmsec.h>
 
 
-/*!     \file msrmain.cpp
-        \brief Test Windows 7 Model Specific Driver implementation
+/*!     \file powerdash.c
 */
 
 #define NT_DEVICE_NAME L"\\Driver\\POWERDASH"

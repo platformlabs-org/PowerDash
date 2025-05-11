@@ -22,15 +22,15 @@
     <None Include="ReadMe.txt" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="msr.h">
+    <ClInclude Include="powerdash.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="msrstruct.h">
+    <ClInclude Include="pdstruct.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="msrmain.c">
+    <ClCompile Include="powerdash.c">
       <Filter>Resource Files</Filter>
     </ClCompile>
   </ItemGroup>

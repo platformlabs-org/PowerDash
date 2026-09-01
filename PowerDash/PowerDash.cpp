@@ -1,6 +1,7 @@
 ﻿#include <windows.h>
 #include <intrin.h>
 #include "PowerDashUi.h"
+#include "PowerDashIoctl.h"
 #include <iostream>
 #include <cstdint>
 #include <cmath>
@@ -13,13 +14,6 @@
 #include <thread>
 #include <string>
 #include <vector>
-
-#define POWERDASH_DEV_TYPE 55000
-#define IO_CTL_MSR_READ        CTL_CODE(POWERDASH_DEV_TYPE, 0x800, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IO_CTL_PCICFG_READ     CTL_CODE(POWERDASH_DEV_TYPE, 0x802, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IO_CTL_MMAP            CTL_CODE(POWERDASH_DEV_TYPE, 0x805, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IO_CTL_MUNMAP          CTL_CODE(POWERDASH_DEV_TYPE, 0x806, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IO_CTL_FNQ_INJECT      CTL_CODE(POWERDASH_DEV_TYPE, 0x80A, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 /* Lenovo EnergyDrv (AcpiVpc.sys) - raw VPC0.DYTC ACPI passthrough.
  * Read-only commands per Lenovo ITSDriver (E:\Module\Lenovo.DYTC):

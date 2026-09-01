@@ -1,9 +1,12 @@
 #include "../PowerDash/PowerDashModel.h"
+#include "../PowerDash/PowerDashProbe.h"
 #include "../PowerDash/PowerDashUi.h"
 
 #include <cmath>
 #include <cstdlib>
+#include <functional>
 #include <iostream>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -287,6 +290,37 @@ void TestModelDecompositionIdentities() {
     Expect(e.identity == "CORES + GFX + REST = PKG", "amd identity");
 }
 
+class FixtureDriverIo : public pd::DriverIo {   // 可编程应答,probe 回放测试用
+public:
+    std::map<uint32_t, std::function<uint64_t()>> msr;   // msr -> 每次读取的值
+    std::map<uint32_t, uint32_t> smn;                    // smn addr -> value
+    bool failAllMsrs = false;
+    bool ReadMsr(unsigned, uint32_t a, uint64_t& out) override {
+        if (failAllMsrs) return false;
+        auto it = msr.find(a);
+        if (it == msr.end()) return false;
+        out = it->second();
+        return true;
+    }
+    bool ReadPciCfg(unsigned, unsigned, unsigned, unsigned, uint32_t&) override { return false; }
+    bool WritePciCfg(unsigned, unsigned, unsigned, unsigned, uint32_t) override { return false; }
+    bool ReadSmn(uint32_t a, uint32_t& out) override {
+        auto it = smn.find(a);
+        if (it == smn.end()) return false;
+        out = it->second; return true;
+    }
+    bool MapPhys(uint64_t, size_t, void*&) override { return false; }
+    void UnmapPhys(void*) override {}
+};
+
+void TestDriverIoFixtureRouting() {
+    FixtureDriverIo io;
+    io.msr[0x611] = [] { return 12345ull; };
+    uint64_t v = 0;
+    Expect(io.ReadMsr(0, 0x611, v) && v == 12345, "fixture msr scripted answer");
+    Expect(!io.ReadMsr(0, 0x999, v), "fixture unknown msr fails");
+}
+
 } // namespace
 
 int main() {
@@ -298,6 +332,7 @@ int main() {
     TestNarrowDashboardStacksGroupsWithoutDroppingMetrics();
     TestAnsiColorsPreserveDashboardGeometry();
     TestModelDecompositionIdentities();
+    TestDriverIoFixtureRouting();
 
     if (failures != 0) {
         std::cerr << failures << " test assertion(s) failed\n";

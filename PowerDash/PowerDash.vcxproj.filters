@@ -18,12 +18,21 @@
     <ClCompile Include="PowerDash.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
+    <ClCompile Include="PowerDashProbe.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
     <ClCompile Include="PowerDashUi.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="PowerDashIoctl.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
     <ClInclude Include="PowerDashModel.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="PowerDashProbe.h">
       <Filter>头文件</Filter>
     </ClInclude>
     <ClInclude Include="PowerDashUi.h">

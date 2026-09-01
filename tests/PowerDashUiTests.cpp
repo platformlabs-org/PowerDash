@@ -366,13 +366,14 @@ void TestIntelProbeReplay() {
 void TestIntelProbeEnergyWraparound() {
     FixtureDriverIo io;
     io.msr[0x606] = [] { return (14ull << 8) | 3ull; };   // 1/16384 J
-    uint64_t pkg = 0xFFFFFE00ull;   // 模拟 32 位能量计数器跨 2^32 回绕
+    uint64_t pkg = 0xFFFFFD00ull;   // 模拟 32 位能量计数器跨 2^32 回绕
     io.msr[0x611] = [&pkg] { pkg = (pkg + 0x200) & 0xFFFFFFFFull; return pkg; };
     pd::PlatformInfo info; info.vendor = pd::Vendor::Intel;
     auto probe = pd::CreateIntelProbe(io, info);
     pd::Sample s;
     Expect(probe->readSample(s), "wraparound sample reads");
-    // ctor prev = 0xFFFFFF00;本帧回绕到 0x100,+2^32 后差分 = 0x200
+    // ctor 基线读得 prev = 0xFFFFFF00;本帧读回绕到 0x100 < prev,
+    // 走 curr += 1<<32 分支后差分 = 0x100000100 - 0xFFFFFF00 = 0x200
     Expect(s.pkgW.valid && std::abs(s.pkgW.value - (512.0 / 16384.0)) < 0.0001,
            "32-bit energy wraparound adds 1<<32 to the delta");
 }

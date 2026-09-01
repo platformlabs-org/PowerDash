@@ -299,6 +299,27 @@ void TestAmdDashboardHidesAbsentSections() {
     Expect(frame.find(" UTIL ") != std::string::npos &&
            frame.find(" TEMP ") != std::string::npos &&
            frame.find(" FREQ ") != std::string::npos, "platform-neutral rows stay");
+    {   // sustainedW 无效(AMD 每帧)时 PKG 功率条不得画 PL1 竖线标记
+        bool checkedBar = false;
+        size_t start = 0;
+        while (start <= frame.size()) {
+            size_t end = frame.find('\n', start);
+            std::string line = frame.substr(start, end - start);
+            if (line.find(" PKG    ") != std::string::npos) {
+                const size_t lb = line.find('[');
+                const size_t rb = lb == std::string::npos
+                                      ? std::string::npos : line.find(']', lb);
+                Expect(lb != std::string::npos && rb != std::string::npos &&
+                           line.substr(lb + 1, rb - lb - 1).find('|') ==
+                               std::string::npos,
+                       "invalid sustained limit must not draw the bar marker");
+                checkedBar = true;
+            }
+            if (end == std::string::npos) break;
+            start = end + 1;
+        }
+        Expect(checkedBar, "amd golden frame contains a PKG bar row");
+    }
     ExpectEveryLineHasWidth(frame, 96, "amd dashboard geometry holds");
 }
 
@@ -345,9 +366,13 @@ class FixtureDriverIo : public pd::DriverIo {   // 可编程应答,probe 回放�
 public:
     std::map<uint32_t, std::function<uint64_t()>> msr;   // msr -> 每次读取的值
     std::map<uint32_t, uint32_t> smn;                    // smn addr -> value
+    // 可选:按 (core, msr) 脚本化读取失败(单核单次注入用)。真实硬件的
+    // 计数器在读取失败期间照常前进,故钩子需自行推进 fixture 计数器。
+    std::function<bool(unsigned core, uint32_t msr)> msrFailure;
     bool failAllMsrs = false;
-    bool ReadMsr(unsigned, uint32_t a, uint64_t& out) override {
+    bool ReadMsr(unsigned core, uint32_t a, uint64_t& out) override {
         if (failAllMsrs) return false;
+        if (msrFailure && msrFailure(core, a)) return false;
         auto it = msr.find(a);
         if (it == msr.end()) return false;
         out = it->second();
@@ -565,6 +590,55 @@ void TestAmdProbeDegradesAndFuses() {
     }
 }
 
+void TestAmdProbeCoreFailureBlanksDomainAndRebaselines() {
+    // 终审修复:逐核 0xC001029A 任一核读取失败 -> coresW 整域 NA(对齐
+    // IntelProbe 域语义,不输出残缺和);失败核标记 stale,恢复帧只刷新
+    // 基线、跳过一次差分(防止陈旧 prev 造成跨帧累积尖峰)。
+    FixtureDriverIo io;
+    io.msr[0xC0010299] = [] { return 14ull << 8; };      // 1/16384 J
+    uint64_t pkg = 0;   // pkg 每帧有效,保证 readSample 帧成立
+    io.msr[0xC001029B] = [&pkg] { pkg += 32768; return pkg; };
+    AmdCoreEnergy coreEnergy(4, 1024);   // 每帧每核 +1024 raw
+    io.msr[0xC001029A] = [&coreEnergy] { return coreEnergy(); };
+    // core 1 的第 2 次读取(ctor 基线之后的首帧采样)失败;钩子先推进
+    // 计数器再报失败,模拟真实硬件"读取失败但计数器照常前进"。调用序
+    // 路由保持对齐。
+    int core1Reads = 0;
+    io.msrFailure = [&core1Reads, &coreEnergy](unsigned core, uint32_t) {
+        if (core == 1 && ++core1Reads == 2) {
+            coreEnergy();
+            return true;
+        }
+        return false;
+    };
+    pd::PlatformInfo info; info.vendor = pd::Vendor::Amd;
+    info.logicalProcessors = 4; info.baseGHz = 3.8;
+    auto probe = pd::CreateAmdProbe(io, info);
+
+    // 基线:ctor 一圈后每核 prev = 1024。
+    pd::Sample s1;
+    Expect(probe->readSample(s1), "pkg carries the failing frame");
+    Expect(!s1.coresW.valid,
+           "any per-core read failure blanks the whole cores domain");
+
+    // 恢复帧:core1 只重置基线(跳过差分),其余 3 核各 +1024 ->
+    // sum = 3072 raw;若沿用陈旧 prev,core1 会贡献 2048(两帧累积)
+    // -> 5120 raw = 0.3125 W 尖峰。
+    pd::Sample s2;
+    Expect(probe->readSample(s2), "recovery frame reads");
+    Expect(s2.coresW.valid, "domain recovers once the failed core reads again");
+    Expect(s2.coresW.valid &&
+               std::abs(s2.coresW.value - (3072.0 / 16384.0)) < 0.0001,
+           "recovery frame re-baselines the failed core (no spike)");
+
+    // 稳态:4 核全部恢复单帧差分,sum = 4096 raw。
+    pd::Sample s3;
+    Expect(probe->readSample(s3), "steady frame reads");
+    Expect(s3.coresW.valid &&
+               std::abs(s3.coresW.value - (4096.0 / 16384.0)) < 0.0001,
+           "steady state resumes full per-frame deltas");
+}
+
 void TestSamplerDrivesSinkAndFillsPlatformIndependentFields() {
     FakeProbe p;
     pd::Sample a; a.pkgW = pd::Ok(5.0); a.mode = "n/a";
@@ -609,6 +683,7 @@ int main() {
     TestAmdProbeReplay();
     TestAmdProbeEnergyWraparound();
     TestAmdProbeDegradesAndFuses();
+    TestAmdProbeCoreFailureBlanksDomainAndRebaselines();
     TestSamplerDrivesSinkAndFillsPlatformIndependentFields();
     TestSamplerExitsAfterFiveConsecutiveFailures();
 

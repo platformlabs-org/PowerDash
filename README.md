@@ -57,10 +57,12 @@ AMD 平台（CPUID `AuthenticAMD` 自动识别，Ryzen 移动 APU）当前支持
   CPU RESIDENCY / SMI / POWER LIMITS 区整体隐藏，功率条刻度回退 60 W spec
   默认值（`spec` 标注）。
 - **不支持**：PSYS/GT 功率、C0/C2/C6 驻留率、SMI 计数、功耗墙读取与设定
-  （`-setpl` 走 Intel MCHBAR 路径，AMD 上不可用）——SMU PMTable 限值解码列为
-  实测机到位后的后续任务。
+  （`-setpl` 走 Intel MCHBAR 路径，AMD 上明确拒绝并提示规划中）——SMU PMTable
+  限值解码列为实测机到位后的后续任务。
 - **CSV v2 语义**：平台不支持的列持续写**空单元格**（不是 0），`platform` 列
   为 `amd`；下游以空单元格区分"平台不支持"与"读数为零"。
+- **实测验收前置**：逐核能量计数器（0xC001029A）按逻辑处理器遍历，若实测发现
+  其按物理核计数（SMT 双计），需改为仅遍历物理核。
 
 ## 单 exe 无感驱动装卸
 
@@ -91,7 +93,7 @@ PowerDash.cpp          CLI 入口：参数解析、命令分发、驱动装卸�
                                 能力位诚实降级（无 PSYS/GT/驻留/SMI/限值）
             │ 每秒 readSample(Sample&)
             ▼
-       PowerDashSampler.*        采样引擎：节拍、能量差分、回绕、历史窗口（平台无关）
+       PowerDashSampler.*        采样引擎：节拍、时间戳/elapsed/util/mode 填充（能量差分/回绕在各 Probe，历史窗口在入口 sink）
             │ 统一 Sample v2 模型（PowerDashModel.h：Reading 自带 valid 语义，
             │ 根除「0 是零值还是不支持」歧义；Decompose 供功率条分解）
             ├─ PowerDashUi.*     面板渲染：RenderDashboard 只读统一模型，

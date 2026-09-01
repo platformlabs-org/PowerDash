@@ -65,20 +65,33 @@ public:
         } else s.pkgW = NA();
 
         /* (b) cores:逐核读 0xC001029A(ReadMsr 的 core 形参正为此用),
-         * 各核独立差分(独立回绕钳制)后求和。 */
+         * 各核独立差分(独立回绕钳制)后求和。域语义对齐 IntelProbe:
+         * 本帧任一核读取失败 -> 整域 NA(不输出残缺和,防静默少计);
+         * 失败核标记 stale,恢复帧只刷新基线、跳过一次差分(陈旧 prev
+         * 直接差分会把两帧能量算进一个采样窗口,造成单帧尖峰)。 */
         {
             uint64_t sum = 0;
             bool anyCore = false;
+            bool anyFailed = false;
             for (unsigned core = 0; core < caps_.logicalProcessors; ++core) {
                 uint64_t e = 0;
-                if (!io_.ReadMsr(core, AMD_CORE_ENERGY_STAT, e)) continue;
+                if (!io_.ReadMsr(core, AMD_CORE_ENERGY_STAT, e)) {
+                    staleCore_[core] = true;   // 下次成功读取只重置基线
+                    anyFailed = true;
+                    continue;
+                }
                 e &= 0xFFFFFFFFull;
+                if (staleCore_[core]) {
+                    staleCore_[core] = false;  // 恢复:刷新基线,跳过本帧差分
+                    prevCoreE_[core] = e;
+                    continue;
+                }
                 if (e < prevCoreE_[core]) e += (1ULL << 32);
                 sum += e - prevCoreE_[core];
                 prevCoreE_[core] = e;
                 anyCore = true;
             }
-            if (anyCore) {
+            if (!anyFailed && anyCore) {
                 s.coresW = Ok(sum * energyUnit_);
                 anyPower = true;
             } else s.coresW = NA();
@@ -145,6 +158,7 @@ private:
         uint64_t v = 0;
         if (io_.ReadMsr(0, AMD_PKG_ENERGY_STAT, v)) prevPkg_ = v & 0xFFFFFFFFull;
         prevCoreE_.assign(caps_.logicalProcessors, 0);
+        staleCore_.assign(caps_.logicalProcessors, false);
         for (unsigned core = 0; core < caps_.logicalProcessors; ++core)
             if (io_.ReadMsr(core, AMD_CORE_ENERGY_STAT, v))
                 prevCoreE_[core] = v & 0xFFFFFFFFull;
@@ -159,6 +173,7 @@ private:
     double energyUnit_ = 0.0;
     uint64_t prevPkg_ = 0;
     std::vector<uint64_t> prevCoreE_;   // 每核 0xC001029A 基线
+    std::vector<bool> staleCore_;      // 上帧读取失败的核:恢复时只重置基线
     uint64_t prevAperf_ = 0, prevMperf_ = 0, prevTsc_ = 0;
 };
 

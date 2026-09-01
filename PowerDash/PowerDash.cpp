@@ -523,6 +523,13 @@ static int RunMonitor(int argc, char* argv[],
      * (this branch maps the PL window itself; the power-monitor path gets
      * its mapping from the IntelProbe, so no shared mapping lives here) */
     if (argc == 4 && std::string(argv[1]) == "-setpl") {
+        /* AMD has no MCHBAR: this branch must never reach the PCI/MMIO
+         * path there (it would touch an unrelated config/MMIO address).
+         * 暂不支持,规划中 - AMD PL 设置待 SMU/PPT 通道落地。 */
+        if (CpuVendor() == pd::Vendor::Amd) {
+            std::cerr << "-setpl is not supported on AMD yet (planned)." << std::endl;
+            rc = 1; break;
+        }
         uint64_t mchbar_val = read_pci_config(hDriver, 0, 0, 0, 0x48);
         if ((mchbar_val & 0x1) == 0) {
             std::cerr << "MCHBAR is not enabled" << std::endl;
@@ -641,6 +648,14 @@ static int RunMonitor(int argc, char* argv[],
     };
     int W = pickDashboardWidth();
     int lastConsoleColumns = consoleColumns();
+
+    /* Ruling-13: the old "Package envelope: min / max / thermal spec" startup
+     * line was dropped in Task 6; restored in simplified form (thermal spec
+     * only, from the probe caps). Intel only - budgetW comes from
+     * MSR_PKG_POWER_INFO; the AMD probe honestly leaves it 0. Emitted once
+     * before the monitor loop for both the VT and non-VT paths. */
+    if (caps.vendor == pd::Vendor::Intel && caps.budgetW > 0.0)
+        std::cout << "Package envelope: thermal spec " << caps.budgetW << " W" << std::endl;
 
     if (vtOn) std::cout << "\x1b[?25l" << std::flush;   /* hide cursor */
 

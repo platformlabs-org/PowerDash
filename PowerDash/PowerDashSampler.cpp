@@ -1,7 +1,7 @@
 // PowerDashSampler.cpp —— 平台无关采样引擎(Task 4)。
 // 数值逻辑自 PowerDash.cpp RunMonitor 逐段迁移,算式原样照搬:
-//   LocalIsoTimestamp   :523-531(旧监视循环 :860 仍在引用,故本文件暂为
-//                        双份之一;Task 6 删除旧循环时同步移除那边一份)
+//   LocalIsoTimestamp   :523-531(唯一定义在本文件;旧监视循环里的那份
+//                        副本已随 Task 6 删除)
 //   util 基线           :676-677(构造期 GetSystemTimes)
 //   util 每帧差分       :819-841(100*(1-dIdle/dTotal),钳 0-100)
 //   可中断节拍等待      :757-758(10 x Sleep(100))

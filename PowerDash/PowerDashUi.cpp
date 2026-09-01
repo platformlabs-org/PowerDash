@@ -404,8 +404,11 @@ std::string RenderDashboard(const DashboardInfo& info,
     const char* pkgColor = mainPower > scale ? RED
                         : (mainPower > sustainedW &&
                            sustainedW > 0.0 ? YELLOW : GREEN);
+    /* the sustained-limit marker is only drawn when the reading is valid -
+     * otherwise (every AMD frame) a stray '|' would sit at bar column 0
+     * while the legend omits the marker text */
     row(" PKG    " + valueField(mainPower) + "  " +
-        powerBar(mainPower, pkgColor, true) + "  " +
+        powerBar(mainPower, pkgColor, sample.powerLimit.sustainedW.valid) + "  " +
         padLeft(SeverityColor(info.ansi, mainPower,
             sustainedW > 0.0 ? sustainedW : scale,
             scale, Fixed(fraction * 100.0, 0) + "% of " + scaleName),

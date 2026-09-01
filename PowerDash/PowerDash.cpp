@@ -1,10 +1,11 @@
 ﻿#include <windows.h>
 #include <intrin.h>
 #include "PowerDashUi.h"
+#include "PowerDashProbe.h"
+#include "PowerDashSampler.h"
 #include "PowerDashIoctl.h"
 #include <iostream>
 #include <cstdint>
-#include <cmath>
 #include <iomanip>
 #include <sstream>
 #include <fstream>
@@ -29,24 +30,6 @@ constexpr uint32_t DYTC_FUNC_CAP   = 0x3;
 constexpr uint32_t DYTC_FUNC_CAP_EXT = 0xA;
 
 constexpr char PD_VER[] = "1.0";
-
-constexpr auto MSR_PKG_ENERGY_STATUS = 0x611;
-constexpr auto MSR_PP0_ENERGY_STATUS = 0x639;
-constexpr auto MSR_PP1_ENERGY_STATUS = 0x641;
-constexpr auto MSR_RAPL_POWER_UNIT = 0x606;
-constexpr auto MSR_PKG_POWER_INFO = 0x614;
-constexpr auto MSR_SYS_ENERGY_STATUS = 0x64D;
-
-/* extra monitor registers (addresses cross-checked against intel pcm
- * 2026-08: src/types.h) */
-constexpr auto MSR_TEMPERATURE_TARGET = 0x1A2;    /* TjMax in bits 23:16   */
-constexpr auto MSR_PACKAGE_THERM_STATUS = 0x1B1;  /* headroom in bits 22:16 */
-constexpr auto MSR_IA32_APERF = 0xE8;
-constexpr auto MSR_IA32_MPERF = 0xE7;
-constexpr auto MSR_PKG_C2_RESIDENCY = 0x60D;
-constexpr auto MSR_PKG_C6_RESIDENCY = 0x3F9;
-constexpr auto MSR_SMI_COUNT = 0x34;
-constexpr auto MSR_PLATFORM_INFO = 0xCE;          /* max non-turbo ratio   */
 
 // Ctrl+C exit flag
 volatile bool g_exitRequested = false;
@@ -163,11 +146,18 @@ static std::string CpuIdLine() {
     return bs + tail;
 }
 
-struct MSR_Request {
-    int core_id;
-    uint64_t msr_address;
-    uint64_t write_value;
-};
+/* CPU vendor via the CPUID.0 vendor string - decides the probe factory's
+ * dispatch ("AuthenticAMD" -> Amd, anything else -> Intel) */
+static pd::Vendor CpuVendor() {
+    int info[4] = {};
+    __cpuid(info, 0);
+    char vendor[13] = {};
+    memcpy(vendor + 0, &info[1], 4);
+    memcpy(vendor + 4, &info[3], 4);
+    memcpy(vendor + 8, &info[2], 4);
+    return !strcmp(vendor, "AuthenticAMD") ? pd::Vendor::Amd
+                                           : pd::Vendor::Intel;
+}
 
 struct PCICFG_Request {
     ULONG bus, dev, func, reg, bytes;
@@ -178,21 +168,6 @@ struct MMAP_Request {
     LARGE_INTEGER address;
     SIZE_T size;
 };
-
-bool read_msr(HANDLE driver, int core_id, uint64_t address, uint64_t& out_value) {
-    MSR_Request request{ core_id, address, 0 };
-    DWORD bytesReturned = 0;
-    return DeviceIoControl(
-        driver,
-        IO_CTL_MSR_READ,
-        &request,
-        sizeof(request),
-        &out_value,
-        sizeof(out_value),
-        &bytesReturned,
-        nullptr
-    );
-}
 
 uint64_t read_pci_config(HANDLE hDriver, ULONG bus, ULONG dev, ULONG func, ULONG reg) {
     PCICFG_Request req = { bus, dev, func, reg, 4, 0 };
@@ -520,16 +495,6 @@ static int CmdMode(int argc, char* argv[]) {
 
 /* ============================ power monitor ============================ */
 
-static std::string LocalIsoTimestamp() {
-    SYSTEMTIME now = {};
-    GetLocalTime(&now);
-    char text[24] = {};
-    sprintf_s(text, "%04u-%02u-%02uT%02u:%02u:%02u",
-              now.wYear, now.wMonth, now.wDay,
-              now.wHour, now.wMinute, now.wSecond);
-    return text;
-}
-
 static int RunMonitor(int argc, char* argv[],
                       const pd::MonitorOptions& monitorOptions = {}) {
     std::ofstream csv;
@@ -554,47 +519,33 @@ static int RunMonitor(int argc, char* argv[],
     int rc = 0;   /* monitor body result */
     do {
 
-    uint64_t power_unit_raw = 0;
-    if (!read_msr(hDriver, 0, MSR_RAPL_POWER_UNIT, power_unit_raw)) {
-        std::cerr << "Failed to read MSR_RAPL_POWER_UNIT." << std::endl;
-        rc = 1; break;
-    }
-
-    uint32_t power_unit_bits = (power_unit_raw >> 0) & 0x0F;
-    uint32_t energy_unit_bits = (power_unit_raw >> 8) & 0x1F;
-    uint32_t time_unit_bits = (power_unit_raw >> 16) & 0x0F;
-
-    double power_unit = 1.0 / pow(2.0, power_unit_bits);
-    double energy_unit = 1.0 / pow(2.0, energy_unit_bits);
-    double time_unit = 1.0 / pow(2.0, time_unit_bits);
-    (void)power_unit; (void)time_unit;
-
-    uint64_t mchbar_val = read_pci_config(hDriver, 0, 0, 0, 0x48);
-    if ((mchbar_val & 0x1) == 0) {
-        std::cerr << "MCHBAR is not enabled" << std::endl;
-        rc = 1; break;
-    }
-
-    mchbar_val &= ~0x1;
-    uint64_t mmio_phys = mchbar_val + 0x59A0;
-    uint64_t mmio_page_base = mmio_phys & ~0xFFF;
-    size_t mmio_size = 0x1000;
-
-    MMAP_Request mmap_req = {};
-    mmap_req.address.QuadPart = mmio_page_base;
-    mmap_req.size = mmio_size;
-
-    uint64_t user_virtual = 0;
-    DWORD returned = 0;
-    if (!DeviceIoControl(hDriver, IO_CTL_MMAP, &mmap_req, sizeof(mmap_req), &user_virtual, sizeof(user_virtual), &returned, nullptr)) {
-        std::cerr << "Failed to map MMIO address. Error code: " << GetLastError() << std::endl;
-        rc = 1; break;
-    }
-
-    uint32_t* mmio = reinterpret_cast<uint32_t*>(user_virtual + (mmio_phys & 0xFFF));
-
-    // Set PL command-line function
+    /* ---- -setpl: set & lock PL1/PL2 through the MCHBAR MMIO window ----
+     * (this branch maps the PL window itself; the power-monitor path gets
+     * its mapping from the IntelProbe, so no shared mapping lives here) */
     if (argc == 4 && std::string(argv[1]) == "-setpl") {
+        uint64_t mchbar_val = read_pci_config(hDriver, 0, 0, 0, 0x48);
+        if ((mchbar_val & 0x1) == 0) {
+            std::cerr << "MCHBAR is not enabled" << std::endl;
+            rc = 1; break;
+        }
+
+        mchbar_val &= ~0x1;
+        uint64_t mmio_phys = mchbar_val + 0x59A0;
+        uint64_t mmio_page_base = mmio_phys & ~0xFFF;
+
+        MMAP_Request mmap_req = {};
+        mmap_req.address.QuadPart = mmio_page_base;
+        mmap_req.size = 0x1000;
+
+        uint64_t user_virtual = 0;
+        DWORD returned = 0;
+        if (!DeviceIoControl(hDriver, IO_CTL_MMAP, &mmap_req, sizeof(mmap_req), &user_virtual, sizeof(user_virtual), &returned, nullptr)) {
+            std::cerr << "Failed to map MMIO address. Error code: " << GetLastError() << std::endl;
+            rc = 1; break;
+        }
+
+        uint32_t* mmio = reinterpret_cast<uint32_t*>(user_virtual + (mmio_phys & 0xFFF));
+
         double setPL1 = std::stod(argv[2]);
         double setPL2 = std::stod(argv[3]);
 
@@ -615,26 +566,16 @@ static int RunMonitor(int argc, char* argv[],
         rc = 0; break;
     }
 
-    /* package power envelope - also the fallback bar scale when the
-     * MMIO PL registers read zero */
-    double thermal_spec_power = 0;
-    uint64_t pkg_power_info = 0;
-    if (read_msr(hDriver, 0, MSR_PKG_POWER_INFO, pkg_power_info)) {
-        double min_power = ((pkg_power_info >> 16) & 0x7FFF) * power_unit;
-        double max_power = ((pkg_power_info >> 32) & 0x7FFF) * power_unit;
-        thermal_spec_power = ((pkg_power_info >> 0) & 0x7FFF) * power_unit;
-        std::cout << std::fixed << std::setprecision(1);
-        std::cout << "Package envelope: min " << min_power
-                  << " / max " << max_power
-                  << " / thermal spec " << thermal_spec_power << " W" << std::endl;
-    }
-
-    /* ---- static facts: TjMax, base frequency, PL time windows ---- */
-    int tjMaxC = 0;
+    /* ---- static CPU facts (CPUID only; RAPL units / TjMax / thermal spec
+     * / PL window statics live inside the IntelProbe) + probe wiring ---- */
+    const std::string cpuLine = CpuIdLine();
+    std::string brand = cpuLine, codeTag;   /* "brand  [codename]" split */
     {
-        uint64_t t = 0;
-        if (read_msr(hDriver, 0, MSR_TEMPERATURE_TARGET, t))
-            tjMaxC = (int)((t >> 16) & 0xFF);
+        size_t tb = cpuLine.find("  [");
+        if (tb != std::string::npos) {
+            brand = cpuLine.substr(0, tb);
+            codeTag = cpuLine.substr(tb + 3, cpuLine.size() - tb - 4);
+        }
     }
     double baseMHz = 0;   /* CPUID 0x16 EAX - pcm's preferred source */
     {
@@ -644,37 +585,33 @@ static int RunMonitor(int argc, char* argv[],
             __cpuid(info, 0x16);
             baseMHz = (double)(info[0] & 0xFFFF);
         }
-        if (baseMHz == 0) {   /* pcm fallback: PLATFORM_INFO ratio */
-            uint64_t pi = 0;
-            if (read_msr(hDriver, 0, MSR_PLATFORM_INFO, pi)) {
-                unsigned ratio = (unsigned)((pi >> 8) & 0xFF);
-                if (ratio) baseMHz = ratio * 100.0;
-            }
+    }
+
+    pd::WindowsDriverIo io(hDriver);
+
+    pd::PlatformInfo info;
+    info.vendor = CpuVendor();
+    info.cpuName = cpuLine;
+    info.logicalProcessors = std::thread::hardware_concurrency();
+    info.baseGHz = baseMHz / 1000.0;
+    if (info.baseGHz <= 0.0) {
+        /* pcm fallback: CPUID 0x16 returns 0 on some parts (observed on
+         * Arrow Lake-H); PLATFORM_INFO max non-turbo ratio x 100 MHz.
+         * Read through the DriverIo abstraction so no raw MSR helper
+         * returns to the entry layer. */
+        uint64_t pi = 0;
+        if (io.ReadMsr(0, 0xCE /* MSR_PLATFORM_INFO */, pi)) {
+            const unsigned ratio = (unsigned)((pi >> 8) & 0xFF);
+            if (ratio) info.baseGHz = ratio * 100.0 / 1000.0;
         }
     }
-    unsigned nLP = std::thread::hardware_concurrency();
 
-    // Initialize MSR values (all deltas sampled on core 0)
-    uint64_t prev_pkg = 0, prev_pp0 = 0, prev_pp1 = 0, prev_sys = 0;
-    read_msr(hDriver, 0, MSR_PKG_ENERGY_STATUS, prev_pkg);
-    read_msr(hDriver, 0, MSR_PP0_ENERGY_STATUS, prev_pp0);
-    read_msr(hDriver, 0, MSR_PP1_ENERGY_STATUS, prev_pp1);
-    read_msr(hDriver, 0, MSR_SYS_ENERGY_STATUS, prev_sys);
-    uint64_t prev_aperf = 0, prev_mperf = 0;
-    uint64_t prev_c2 = 0, prev_c6 = 0, prev_smi = 0;
-    read_msr(hDriver, 0, MSR_IA32_APERF, prev_aperf);
-    read_msr(hDriver, 0, MSR_IA32_MPERF, prev_mperf);
-    read_msr(hDriver, 0, MSR_PKG_C2_RESIDENCY, prev_c2);
-    read_msr(hDriver, 0, MSR_PKG_C6_RESIDENCY, prev_c6);
-    read_msr(hDriver, 0, MSR_SMI_COUNT, prev_smi);
-    uint64_t prev_tsc = __rdtsc();
-
-    /* true CPU utilization (Task-Manager style) comes from GetSystemTimes
-     * deltas; package C0+C1 residency (100 - PKG_C2_RESIDENCY) is NOT it:
-     * a single busy thread keeps the package out of C2 and would read
-     * ~100% "utilization" on an otherwise idle machine */
-    FILETIME prevIdle = {}, prevKernel = {}, prevUser = {};
-    GetSystemTimes(&prevIdle, &prevKernel, &prevUser);
+    auto probe = pd::CreateProbe(io, info);   /* vendor 分流工厂 */
+    if (!probe) {
+        std::cerr << "Unsupported platform." << std::endl;
+        rc = 1; break;
+    }
+    const pd::PlatformCaps& caps = probe->caps();
 
     std::cout << std::fixed << std::setprecision(2);
 
@@ -707,16 +644,6 @@ static int RunMonitor(int argc, char* argv[],
 
     if (vtOn) std::cout << "\x1b[?25l" << std::flush;   /* hide cursor */
 
-    const std::string cpuLine = CpuIdLine();
-    std::string brand = cpuLine, codeTag;   /* "brand  [codename]" split */
-    {
-        size_t tb = cpuLine.find("  [");
-        if (tb != std::string::npos) {
-            brand = cpuLine.substr(0, tb);
-            codeTag = cpuLine.substr(tb + 3, cpuLine.size() - tb - 4);
-        }
-    }
-
     pd::DashboardInfo dashboardInfo;
     dashboardInfo.version = PD_VER;
     dashboardInfo.cpuBrand = brand;
@@ -731,164 +658,32 @@ static int RunMonitor(int argc, char* argv[],
     }
     dashboardInfo.ansi = vtOn;
 
-    /* Task 6 将移除的 v1→v2 适配:本循环仍是 Intel v1 局部量,在此把它们
-     * 拼成 PlatformCaps(静态事实,原 DashboardInfo 字段迁入)供 UI 消费 */
-    pd::PlatformCaps platformCaps;
-    platformCaps.vendor = pd::Vendor::Intel;
-    platformCaps.cpuName = cpuLine;
-    platformCaps.gfxPower = true;        /* PP1 MSR 一直被读取 */
-    platformCaps.platformPower = true;   /* PSYS MSR 一直被读取 */
-    platformCaps.powerLimits = true;     /* MCHBAR MMIO 已映射成功才到这里 */
-    platformCaps.residency = true;
-    platformCaps.smi = true;
-    platformCaps.budgetW = thermal_spec_power;
-    platformCaps.tjMaxC = tjMaxC;
-    platformCaps.baseGHz = baseMHz / 1000.0;
-    platformCaps.logicalProcessors = nLP;
+    /* per-frame DYTC mode query, same call the old loop body made */
+    auto QueryDytcMode = []() -> std::string {
+        uint32_t mraw = 0;
+        if (EnergyDytc(DYTC_GET, mraw) && (mraw & 1))
+            return DecodeMode(mraw);
+        return "n/a";
+    };
 
-    const ULONGLONG monitorStarted = GetTickCount64();
+    pd::Sampler sampler(*probe, QueryDytcMode, &g_exitRequested);
 
-    // Main loop
     std::vector<double> hist;   /* rolling pkg power samples (sparkline) */
     int frame = 0;
     std::vector<std::string> previousFrame;   /* last frame, line by line */
     int cursorRowsBelowFrame = 0;             /* 1 after wiping a shrank frame */
-    while (!g_exitRequested &&
-           (monitorOptions.runSeconds < 0 ||
-            frame < (int)std::ceil(monitorOptions.runSeconds))) {
-        for (int i = 0; i < 10 && !g_exitRequested; ++i)
-            Sleep(100);   /* 1 s sample window, interruptible */
-
-        uint64_t curr_pkg = 0, curr_pp0 = 0, curr_pp1 = 0, curr_sys = 0;
-        read_msr(hDriver, 0, MSR_PKG_ENERGY_STATUS, curr_pkg);
-        read_msr(hDriver, 0, MSR_PP0_ENERGY_STATUS, curr_pp0);
-        read_msr(hDriver, 0, MSR_PP1_ENERGY_STATUS, curr_pp1);
-        read_msr(hDriver, 0, MSR_SYS_ENERGY_STATUS, curr_sys);
-
-        if (curr_pkg < prev_pkg) curr_pkg += (1ULL << 32);
-        if (curr_pp0 < prev_pp0) curr_pp0 += (1ULL << 32);
-        if (curr_pp1 < prev_pp1) curr_pp1 += (1ULL << 32);
-        if (curr_sys < prev_sys) curr_sys += (1ULL << 32);
-
-        double pkg_power = (curr_pkg - prev_pkg) * energy_unit;
-        double pp0_power = (curr_pp0 - prev_pp0) * energy_unit;
-        double pp1_power = (curr_pp1 - prev_pp1) * energy_unit;
-        double sys_power = (curr_sys - prev_sys) * energy_unit;
-
-        prev_pkg = curr_pkg;
-        prev_pp0 = curr_pp0;
-        prev_pp1 = curr_pp1;
-        prev_sys = curr_sys;
-
-        uint32_t pl1_raw = mmio[0];
-        uint32_t pl2_raw = mmio[1];
-        double pl1_watt = (pl1_raw & 0x7FFF) * 0.125;
-        double pl2_watt = (pl2_raw & 0x7FFF) * 0.125;
-        bool plLocked = ((pl1_raw >> 31) & 1) != 0;
-
-        /* temperature (package therm status: headroom below TjMax) */
-        int tempC = -1;
-        {
-            uint64_t th = 0;
-            if (tjMaxC > 0 &&
-                read_msr(hDriver, 0, MSR_PACKAGE_THERM_STATUS, th) &&
-                (th & (1ULL << 31)))
-                tempC = tjMaxC - (int)((th >> 16) & 0x7F);
-        }
-
-        /* avg frequency via APERF/MPERF (core 0) */
-        uint64_t aperf = 0, mperf = 0, c2 = 0, c6 = 0, smi = 0;
-        read_msr(hDriver, 0, MSR_IA32_APERF, aperf);
-        read_msr(hDriver, 0, MSR_IA32_MPERF, mperf);
-        read_msr(hDriver, 0, MSR_PKG_C2_RESIDENCY, c2);
-        read_msr(hDriver, 0, MSR_PKG_C6_RESIDENCY, c6);
-        read_msr(hDriver, 0, MSR_SMI_COUNT, smi);
-        uint64_t tsc = __rdtsc();
-
-        double freqGHz = 0;
-        if (baseMHz > 0 && mperf > prev_mperf)
-            freqGHz = baseMHz * (double)(aperf - prev_aperf)
-                      / (double)(mperf - prev_mperf) / 1000.0;
-
-        double dtsc = (double)(tsc - prev_tsc);
-        double c2pct = dtsc > 0 ? 100.0 * (double)(c2 - prev_c2) / dtsc : 0;
-        double c6pct = dtsc > 0 ? 100.0 * (double)(c6 - prev_c6) / dtsc : 0;
-        if (c6pct > c2pct) c6pct = c2pct;      /* C6 counts within C2+ */
-        double c0pct = 100.0 - c2pct; if (c0pct < 0) c0pct = 0;
-        double c2mid = c2pct - c6pct;
-        uint64_t smiDelta = smi - prev_smi;
-
-        double utilPct = 0.0;
-        {
-            FILETIME idle, kernel, user;
-            if (GetSystemTimes(&idle, &kernel, &user)) {
-                const auto toU64 = [](const FILETIME& ft) -> unsigned long long {
-                    return (static_cast<unsigned long long>(ft.dwHighDateTime) << 32)
-                           | ft.dwLowDateTime;
-                };
-                const double dIdle = static_cast<double>(
-                    toU64(idle) - toU64(prevIdle));
-                const double dTotal = static_cast<double>(
-                    (toU64(kernel) - toU64(prevKernel)) +
-                    (toU64(user) - toU64(prevUser)));
-                if (dTotal > 0.0) {
-                    utilPct = 100.0 * (1.0 - dIdle / dTotal);
-                    if (utilPct < 0.0) utilPct = 0.0;
-                    if (utilPct > 100.0) utilPct = 100.0;
-                }
-                prevIdle = idle;
-                prevKernel = kernel;
-                prevUser = user;
-            }
-        }
-
-        prev_aperf = aperf; prev_mperf = mperf;
-        prev_c2 = c2;       prev_c6 = c6;
-        prev_smi = smi;     prev_tsc = tsc;
-
-        const char* modeName = "n/a";
-        {
-            uint32_t mraw = 0;
-            if (EnergyDytc(DYTC_GET, mraw) && (mraw & 1))
-                modeName = DecodeMode(mraw);
-        }
-
-        /* Task 6 将移除的 v1→v2 适配:从上面的 v1 局部量构造 Sample v2
-         * (UI/CSV 已只消费统一模型)。PSYS 为 0 或 tau 编码为 0 时按
-         * v2 语义给 NA;PL2 为 0 沿用 v1 的"未知"处理(刻度走 fallback) */
-        pd::Sample sample;
-        sample.timestamp = LocalIsoTimestamp();
-        sample.elapsedS = (GetTickCount64() - monitorStarted) / 1000.0;
-        sample.pkgW = pd::Ok(pkg_power);
-        sample.coresW = pd::Ok(pp0_power);
-        sample.gfxW = pd::Ok(pp1_power);
-        sample.platformW = sys_power > 0.0 ? pd::Ok(sys_power) : pd::NA();
-        sample.powerLimit.sustainedW = pd::Ok(pl1_watt);
-        sample.powerLimit.burstW =
-            pl2_watt > 0.0 ? pd::Ok(pl2_watt) : pd::NA();
-        {
-            const uint64_t rawTau = (pl1_raw >> 17) & 0x7F;
-            sample.powerLimit.sustainedWindowS =
-                rawTau ? pd::Ok(rawTau * time_unit) : pd::NA();
-        }
-        sample.powerLimit.locked = plLocked;
-        sample.tempC = tempC >= 0 ? pd::Ok(tempC) : pd::NA();
-        sample.freqGHz = freqGHz > 0.0 ? pd::Ok(freqGHz) : pd::NA();
-        sample.c0Pct = pd::Ok(c0pct);
-        sample.c2Pct = pd::Ok(c2mid);
-        sample.c6Pct = pd::Ok(c6pct);
-        sample.utilPct = pd::Ok(utilPct);
-        sample.smiDelta = smiDelta;
-        sample.mode = modeName;
+    const bool ok = sampler.Run(monitorOptions.runSeconds,
+        [&](const pd::Sample& sample) {
 
         if (csv.is_open()) {
-            csv << pd::CsvRow(pd::Vendor::Intel, sample) << '\n';
+            csv << pd::CsvRow(caps.vendor, sample) << '\n';
             csv.flush();
             if (!csv) {
                 std::cerr << "CSV write failed: " << monitorOptions.csvPath
                           << std::endl;
                 rc = 2;
-                break;
+                g_exitRequested = true;   /* stop the sampler after this frame */
+                return;
             }
         }
 
@@ -903,11 +698,11 @@ static int RunMonitor(int argc, char* argv[],
                 W = pickDashboardWidth();
                 dashboardInfo.width = W;
             }
-            hist.push_back(pkg_power);
+            hist.push_back(sample.pkgW.value);
             if (hist.size() > 60)
                 hist.erase(hist.begin(), hist.end() - 60);
             const std::string dashboard =
-                pd::RenderDashboard(dashboardInfo, platformCaps, sample, hist);
+                pd::RenderDashboard(dashboardInfo, caps, sample, hist);
 
             /* flicker-free refresh: rewind to the frame top and overwrite
              * in place. Unchanged lines are only skipped over (cursor-down,
@@ -972,14 +767,14 @@ static int RunMonitor(int argc, char* argv[],
                       << " SMI+" << sample.smiDelta.value_or(0) << std::endl;
         }
         frame++;
+    });
+
+    if (!ok) {   /* 5 consecutive frames without any valid power domain */
+        std::cerr << "Telemetry lost (5 consecutive failures)." << std::endl;
+        rc = 2;
     }
 
     if (vtOn) std::cout << "\r\n\x1b[?25h" << std::flush;   /* restore cursor */
-
-    // Cleanup
-    MMAP_Request unmap = {};
-    unmap.address.QuadPart = user_virtual;
-    DeviceIoControl(hDriver, IO_CTL_MUNMAP, &unmap, sizeof(unmap), nullptr, 0, &returned, nullptr);
 
     } while (0);
 

@@ -24,6 +24,9 @@
     <ClCompile Include="PowerDashProbe.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
+    <ClCompile Include="PowerDashSampler.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
     <ClCompile Include="PowerDashUi.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
@@ -36,6 +39,9 @@
       <Filter>头文件</Filter>
     </ClInclude>
     <ClInclude Include="PowerDashProbe.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="PowerDashSampler.h">
       <Filter>头文件</Filter>
     </ClInclude>
     <ClInclude Include="PowerDashUi.h">

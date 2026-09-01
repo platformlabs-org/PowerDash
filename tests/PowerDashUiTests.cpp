@@ -1,5 +1,6 @@
 #include "../PowerDash/PowerDashModel.h"
 #include "../PowerDash/PowerDashProbe.h"
+#include "../PowerDash/PowerDashSampler.h"
 #include "../PowerDash/PowerDashUi.h"
 
 #include <cmath>
@@ -313,6 +314,18 @@ public:
     void UnmapPhys(void*) override {}
 };
 
+class FakeProbe : public pd::IPlatformProbe {   // 脚本化样本序列
+public:
+    std::vector<pd::Sample> script; size_t i = 0; int reads = 0;
+    pd::PlatformCaps capsHolder;
+    const pd::PlatformCaps& caps() const override { return capsHolder; }
+    bool readSample(pd::Sample& s) override {
+        ++reads;
+        if (i >= script.size()) return false;
+        s = script[i++]; return true;
+    }
+};
+
 void TestDriverIoFixtureRouting() {
     FixtureDriverIo io;
     io.msr[0x611] = [] { return 12345ull; };
@@ -378,6 +391,32 @@ void TestIntelProbeEnergyWraparound() {
            "32-bit energy wraparound adds 1<<32 to the delta");
 }
 
+void TestSamplerDrivesSinkAndFillsPlatformIndependentFields() {
+    FakeProbe p;
+    pd::Sample a; a.pkgW = pd::Ok(5.0); a.mode = "n/a";
+    pd::Sample b; b.pkgW = pd::Ok(6.0);
+    p.script = {a, b};
+    std::vector<pd::Sample> got;
+    pd::Sampler s(p, [] { return "Intelligent (APM)"; }, nullptr,
+                  [] {});                       // 即时 tick,测试不真实睡眠
+    bool ok = s.Run(2.0, [&](const pd::Sample& x) { got.push_back(x); });
+    Expect(ok, "sampler completes scripted run");
+    Expect(got.size() == 2, "one sink call per tick");
+    Expect(got[0].utilPct.valid, "sampler fills utilization");
+    Expect(got[0].mode == "Intelligent (APM)", "sampler fills mode");
+    Expect(!got[0].timestamp.empty() && got[0].elapsedS >= 0.0,
+           "sampler fills timestamp/elapsed");
+}
+
+void TestSamplerExitsAfterFiveConsecutiveFailures() {
+    FakeProbe p;                                // script 为空,每次 readSample 失败
+    int sinks = 0;
+    pd::Sampler s(p, [] { return "n/a"; }, nullptr, [] {});
+    bool ok = s.Run(-1.0, [&](const pd::Sample&) { ++sinks; });
+    Expect(!ok, "five consecutive failures abort the run");
+    Expect(sinks == 0, "failed frames never reach the sink");
+}
+
 } // namespace
 
 int main() {
@@ -392,6 +431,8 @@ int main() {
     TestDriverIoFixtureRouting();
     TestIntelProbeReplay();
     TestIntelProbeEnergyWraparound();
+    TestSamplerDrivesSinkAndFillsPlatformIndependentFields();
+    TestSamplerExitsAfterFiveConsecutiveFailures();
 
     if (failures != 0) {
         std::cerr << failures << " test assertion(s) failed\n";

@@ -17,6 +17,8 @@ struct DeviceExtension
 {
     HANDLE devMemHandle;
     HANDLE counterSetHandle;
+    FAST_MUTEX smnMutex;       /* serializes the SMN 0x60-write / 0x64-read
+                                  pair in IO_CTL_SMN_READ (AMD northbridge) */
     PDEVICE_OBJECT lowerDO;     /* FDO only: device below us in the PnP stack */
 };
 
@@ -273,6 +275,7 @@ DriverEntry(
         return status;
     }
     pExt->counterSetHandle = NULL;
+    ExInitializeFastMutex(&pExt->smnMutex);   /* DriverEntry runs at PASSIVE_LEVEL */
 
     IoCreateSymbolicLink(&dosDeviceName, &UnicodeString);
 
@@ -338,6 +341,7 @@ PnpAddDevice(
     pExt = (struct DeviceExtension *)fdo->DeviceExtension;
     pExt->devMemHandle = NULL;
     pExt->counterSetHandle = NULL;
+    ExInitializeFastMutex(&pExt->smnMutex);   /* AddDevice runs at PASSIVE_LEVEL */
     pExt->lowerDO = IoAttachDeviceToDeviceStack(fdo, PhysicalDeviceObject);
 
     if (!pExt->lowerDO)
@@ -666,6 +670,51 @@ NTSTATUS deviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
                 }
                 Irp->IoStatus.Information = size;                                         // result size
                 break;
+
+            case IO_CTL_SMN_READ:
+            {
+                struct SMN_Request* req = (struct SMN_Request*)Irp->AssociatedIrp.SystemBuffer;
+                ULONG32 smnAddr = 0, smnData = 0;
+                if (inputSize < sizeof(struct SMN_Request))
+                {
+                    status = STATUS_INVALID_PARAMETER;
+                    break;
+                }
+                slot.u.AsULONG = 0;                          /* B0:D0:F0 */
+                ExAcquireFastMutex(&pExt->smnMutex);
+#pragma warning(push)
+#pragma warning(disable: 4996)
+                __try
+                {
+                    smnAddr = req->address;
+                    /* 1) write the SMN address window 0x60; nested if/else instead
+                       of __leave so control always reaches the mutex release below */
+                    if (HalSetBusDataByOffset(PCIConfiguration, 0, slot.u.AsULONG,
+                                              &smnAddr, 0x60, 4) != 4)
+                    {
+                        status = STATUS_DEVICE_NOT_READY;
+                    }
+                    /* 2) read the SMN data window 0x64 */
+                    else if (HalGetBusDataByOffset(PCIConfiguration, 0, slot.u.AsULONG,
+                                                   &smnData, 0x64, 4) != 4)
+                    {
+                        status = STATUS_DEVICE_NOT_READY;
+                    }
+                    else
+                    {
+                        req->value = smnData;
+                    }
+                }
+                __except (EXCEPTION_EXECUTE_HANDLER)
+                {
+                    status = GetExceptionCode();
+                    DbgPrint("PowerDash: SMN read exception 0x%X addr 0x%X\n", status, req->address);
+                }
+#pragma warning(pop)
+                ExReleaseFastMutex(&pExt->smnMutex);         /* every path incl. exceptions */
+                Irp->IoStatus.Information = sizeof(struct SMN_Request);   // METHOD_BUFFERED write-back
+                break;
+            }
 
             case IO_CTL_FNQ_INJECT:
                 FnQInject(output);          /* count of events, or 0x8ZZSSSS error code */

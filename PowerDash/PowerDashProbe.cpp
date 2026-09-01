@@ -53,10 +53,17 @@ bool WindowsDriverIo::WritePciCfg(unsigned bus, unsigned dev, unsigned fn,
 }
 
 bool WindowsDriverIo::ReadSmn(uint32_t smnAddr, uint32_t& out) {
-    // Task 7 接入 IO_CTL_SMN_READ 之前的占位
-    (void)smnAddr;
-    (void)out;
-    return false;
+    // 驱动内 FAST_MUTEX 原子完成 0x60 写地址 / 0x64 读数据序列;
+    // 结构体同缓冲进出(MethodBuffered),驱动 Information = sizeof(SMN_Request) 回写 value。
+    SMN_Request req{};
+    req.address = smnAddr;
+    req.value = 0;
+    DWORD returned = 0;
+    if (!DeviceIoControl(h_, IO_CTL_SMN_READ, &req, sizeof(req),
+                         &req, sizeof(req), &returned, nullptr))
+        return false;
+    out = req.value;
+    return true;
 }
 
 bool WindowsDriverIo::MapPhys(uint64_t phys, size_t len, void*& virt) {

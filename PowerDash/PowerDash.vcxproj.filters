@@ -18,6 +18,9 @@
     <ClCompile Include="PowerDash.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
+    <ClCompile Include="PowerDashIntel.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
     <ClCompile Include="PowerDashProbe.cpp">
       <Filter>源文件</Filter>
     </ClCompile>

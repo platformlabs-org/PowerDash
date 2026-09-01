@@ -321,6 +321,62 @@ void TestDriverIoFixtureRouting() {
     Expect(!io.ReadMsr(0, 0x999, v), "fixture unknown msr fails");
 }
 
+void TestIntelProbeReplay() {
+    FixtureDriverIo io;
+    // 单位寄存器:power bits=3(0.125W), energy bits=14(1/16384 J), time bits=10
+    io.msr[0x606] = [] { return (14ull << 8) | 3ull; };
+    uint64_t pkg = 0;   // 每 tick 增 32768 raw = 2.0 J -> 2 W
+    io.msr[0x611] = [&pkg] { pkg += 32768; return pkg; };
+    uint64_t pp0 = 0;   // 每 tick 增 16384 raw = 1.0 J -> 1 W
+    io.msr[0x639] = [&pp0] { pp0 += 16384; return pp0; };
+    uint64_t pp1 = 0, sys = 0;
+    io.msr[0x641] = [&pp1] { pp1 += 8192; return pp1; };   // 0.5 W
+    io.msr[0x64D] = [&sys] { sys += 49152; return sys; };  // 3.0 W
+    // 温度:MSR_PACKAGE_THERM_STATUS 实为 0x1B1(PowerDash.cpp:43,
+    // brief 的 0x613 是笔误);valid bit31 + headroom 31 -> 105-31=74 C
+    io.msr[0x1B1] = [] { return (1ull << 31) | (0x1Full << 16); };
+    io.msr[0x1A2] = [] { return 105ull << 16; };           // TjMax=105
+    pd::PlatformInfo info; info.vendor = pd::Vendor::Intel;
+    info.cpuName = "Intel(R) Core(TM) Ultra 5 225H  [Arrow Lake-H]";
+    info.logicalProcessors = 16; info.baseGHz = 2.5;
+    auto probe = pd::CreateIntelProbe(io, info);
+    Expect(probe != nullptr, "intel probe constructs");
+    Expect(probe->caps().vendor == pd::Vendor::Intel &&
+           probe->caps().tjMaxC == 105, "caps carry tjMax");
+    // 构造期已消费一次 prev;第一帧即得到差分功率
+    pd::Sample s;
+    Expect(probe->readSample(s), "first sample reads");
+    Expect(s.pkgW.valid && std::abs(s.pkgW.value - 2.0) < 0.01,
+           "pkg power from replayed delta");
+    Expect(s.coresW.valid && std::abs(s.coresW.value - 1.0) < 0.01,
+           "cores = PP0 delta");
+    Expect(s.gfxW.valid && std::abs(s.gfxW.value - 0.5) < 0.01, "gfx = PP1");
+    Expect(s.platformW.valid && std::abs(s.platformW.value - 3.0) < 0.01,
+           "platform = PSYS");
+    Expect(s.tempC.valid && std::abs(s.tempC.value - 74.0) < 0.01,
+           "temp = tjMax - therm headroom");
+    // MCHBAR/MMAP 在 FixtureDriverIo 下失败 -> 能力降级,不是构造失败
+    Expect(!probe->caps().powerLimits, "MCHBAR unavailable degrades powerLimits");
+    Expect(!s.powerLimit.sustainedW.valid && !s.powerLimit.burstW.valid,
+           "PL readings stay invalid without the MMIO window");
+    // APERF/MPERF 未脚本化 -> 频率无效
+    Expect(!s.freqGHz.valid, "APERF/MPERF unscripted leaves freq invalid");
+}
+
+void TestIntelProbeEnergyWraparound() {
+    FixtureDriverIo io;
+    io.msr[0x606] = [] { return (14ull << 8) | 3ull; };   // 1/16384 J
+    uint64_t pkg = 0xFFFFFE00ull;   // 模拟 32 位能量计数器跨 2^32 回绕
+    io.msr[0x611] = [&pkg] { pkg = (pkg + 0x200) & 0xFFFFFFFFull; return pkg; };
+    pd::PlatformInfo info; info.vendor = pd::Vendor::Intel;
+    auto probe = pd::CreateIntelProbe(io, info);
+    pd::Sample s;
+    Expect(probe->readSample(s), "wraparound sample reads");
+    // ctor prev = 0xFFFFFF00;本帧回绕到 0x100,+2^32 后差分 = 0x200
+    Expect(s.pkgW.valid && std::abs(s.pkgW.value - (512.0 / 16384.0)) < 0.0001,
+           "32-bit energy wraparound adds 1<<32 to the delta");
+}
+
 } // namespace
 
 int main() {
@@ -333,6 +389,8 @@ int main() {
     TestAnsiColorsPreserveDashboardGeometry();
     TestModelDecompositionIdentities();
     TestDriverIoFixtureRouting();
+    TestIntelProbeReplay();
+    TestIntelProbeEnergyWraparound();
 
     if (failures != 0) {
         std::cerr << failures << " test assertion(s) failed\n";

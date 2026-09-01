@@ -493,13 +493,16 @@ void TestAmdProbeReplay() {
     io.msr[0xC0010299] = [] { return 14ull << 8; };
     uint64_t pkg = 0;   // 每读 +32768 raw = 2.0 J -> 2.0 W
     io.msr[0xC001029B] = [&pkg] { pkg += 32768; return pkg; };
-    // 16 核每帧各 +1024 raw -> 合计 16384 raw = 1.0 W
-    AmdCoreEnergy coreEnergy(16, 1024);
+    // 8 物理核(0xC001029A 按物理核计数,SMT 兄弟共享 -> 每核只读一个
+    // 代表 LP)每帧各 +2048 raw -> 合计 8*2048 = 16384 raw = 1.0 W
+    AmdCoreEnergy coreEnergy(8, 2048);
     io.msr[0xC001029A] = [&coreEnergy] { return coreEnergy(); };
-    io.smn[0x59800] = 640u << 21;   // Tctl: 640 * 0.125 = 80.0 C
+    io.smn[0x59800] = 640u << 21;   // Tctl: 640 * 0.125 = 80.0 C(无 RANGE_SEL)
     pd::PlatformInfo info; info.vendor = pd::Vendor::Amd;
     info.cpuName = "AMD Ryzen 7 8845H  [Hawk Point]";
-    info.logicalProcessors = 16; info.baseGHz = 3.8;
+    info.logicalProcessors = 16; info.physicalCores = 8;   // 8C/16T
+    info.coreLPs = {0, 2, 4, 6, 8, 10, 12, 14};            // Windows 相邻对
+    info.baseGHz = 3.8;
     auto probe = pd::CreateAmdProbe(io, info);
     Expect(probe != nullptr, "amd probe constructs");
     pd::PlatformCaps c = probe->caps();
@@ -539,12 +542,15 @@ void TestAmdProbeEnergyWraparound() {
         Expect(!s.coresW.valid, "zero logical processors leaves cores NA");
     }
     {   // 逐核独立回绕:4 核全部从 2^32-512 起步,每读 +0x200
+        // (nLP=4/physicalCores=4:无 SMT,代表集即全部 4 个 LP)
         FixtureDriverIo io;
         io.msr[0xC0010299] = [] { return 14ull << 8; };
         AmdCoreEnergy coreEnergy(4, 0x200, 0xFFFFFD00ull);
         io.msr[0xC001029A] = [&coreEnergy] { return coreEnergy(); };
         pd::PlatformInfo info; info.vendor = pd::Vendor::Amd;
-        info.logicalProcessors = 4; info.baseGHz = 3.8;
+        info.logicalProcessors = 4; info.physicalCores = 4;
+        info.coreLPs = {0, 1, 2, 3};
+        info.baseGHz = 3.8;
         auto probe = pd::CreateAmdProbe(io, info);
         pd::Sample s;
         Expect(probe->readSample(s), "per-core wraparound sample reads");
@@ -598,7 +604,7 @@ void TestAmdProbeCoreFailureBlanksDomainAndRebaselines() {
     io.msr[0xC0010299] = [] { return 14ull << 8; };      // 1/16384 J
     uint64_t pkg = 0;   // pkg 每帧有效,保证 readSample 帧成立
     io.msr[0xC001029B] = [&pkg] { pkg += 32768; return pkg; };
-    AmdCoreEnergy coreEnergy(4, 1024);   // 每帧每核 +1024 raw
+    AmdCoreEnergy coreEnergy(4, 1024);   // 每帧每核 +1024 raw(4/4 无 SMT)
     io.msr[0xC001029A] = [&coreEnergy] { return coreEnergy(); };
     // core 1 的第 2 次读取(ctor 基线之后的首帧采样)失败;钩子先推进
     // 计数器再报失败,模拟真实硬件"读取失败但计数器照常前进"。调用序
@@ -612,7 +618,9 @@ void TestAmdProbeCoreFailureBlanksDomainAndRebaselines() {
         return false;
     };
     pd::PlatformInfo info; info.vendor = pd::Vendor::Amd;
-    info.logicalProcessors = 4; info.baseGHz = 3.8;
+    info.logicalProcessors = 4; info.physicalCores = 4;
+    info.coreLPs = {0, 1, 2, 3};
+    info.baseGHz = 3.8;
     auto probe = pd::CreateAmdProbe(io, info);
 
     // 基线:ctor 一圈后每核 prev = 1024。
@@ -637,6 +645,167 @@ void TestAmdProbeCoreFailureBlanksDomainAndRebaselines() {
     Expect(s3.coresW.valid &&
                std::abs(s3.coresW.value - (4096.0 / 16384.0)) < 0.0001,
            "steady state resumes full per-frame deltas");
+}
+
+void TestAmdProbeScansPhysicalCoresOnly() {
+    // tb16g7 实测缺陷:0xC001029A 按物理核计数,SMT 兄弟 LP 共享同一
+    // 计数器;遍历全部 nLP 会双计(实测 IA 167% of PKG)。Windows 枚举
+    // 同核兄弟为相邻 LP(8C/16T mask 0x0003/0x000C/…,代表集 =
+    // {0,2,4,6,8,10,12,14}),探针按 coreLPs 每物理核只读一个代表 LP。
+    // fixture 提供 8 个独立计数器,每物理核每帧 +1024 raw -> 合计
+    // 8*1024 = 8192 raw = 0.5 W;若实现遍历 16 个 LP,fixture 的调用
+    // 路由被拉长一倍,读数翻倍,数值断言立即失败;oddLP 钩子另证
+    // 0xC001029A 从不寻址奇数 LP(SMT 兄弟)。
+    FixtureDriverIo io;
+    io.msr[0xC0010299] = [] { return 14ull << 8; };       // 1/16384 J
+    uint64_t pkg = 0;   // pkg 每帧有效,保证帧成立
+    io.msr[0xC001029B] = [&pkg] { pkg += 32768; return pkg; };
+    AmdCoreEnergy coreEnergy(8, 1024);
+    io.msr[0xC001029A] = [&coreEnergy] { return coreEnergy(); };
+    bool readOddLp = false;
+    io.msrFailure = [&readOddLp](unsigned core, uint32_t msr) {
+        if (msr == 0xC001029A && (core & 1)) readOddLp = true;
+        return false;                                     // 只观测不注入
+    };
+    pd::PlatformInfo info; info.vendor = pd::Vendor::Amd;
+    info.logicalProcessors = 16; info.physicalCores = 8;  // 8C/16T SMT
+    info.coreLPs = {0, 2, 4, 6, 8, 10, 12, 14};
+    info.baseGHz = 3.8;
+    auto probe = pd::CreateAmdProbe(io, info);
+    pd::Sample s;
+    Expect(probe->readSample(s), "smt-dedup sample reads");
+    Expect(s.coresW.valid && std::abs(s.coresW.value - 0.5) < 0.0001,
+           "cores counts each physical core exactly once");
+    Expect(!readOddLp, "per-core MSR never addresses an SMT sibling LP");
+
+    // coreLPs 越界(> nLP)-> 整表弃用,退回全 LP 遍历(保底不残缺):
+    // 16 LP fixture 下 cores 域读满 16 个计数器仍成立。
+    FixtureDriverIo io2;
+    io2.msr[0xC0010299] = [] { return 14ull << 8; };
+    uint64_t pkg2 = 0;
+    io2.msr[0xC001029B] = [&pkg2] { pkg2 += 32768; return pkg2; };
+    AmdCoreEnergy coreEnergy2(16, 512);                   // 16*512 = 8192
+    io2.msr[0xC001029A] = [&coreEnergy2] { return coreEnergy2(); };
+    pd::PlatformInfo info2; info2.vendor = pd::Vendor::Amd;
+    info2.logicalProcessors = 16; info2.physicalCores = 8;
+    info2.coreLPs = {0, 2, 99};                           // 越界条目
+    auto probe2 = pd::CreateAmdProbe(io2, info2);
+    pd::Sample s2;
+    Expect(probe2->readSample(s2), "fallback sample reads");
+    Expect(s2.coresW.valid && std::abs(s2.coresW.value - 0.5) < 0.0001,
+           "invalid topology falls back to all-LP scan");
+}
+
+void TestAmdProbeTempRangeOffset() {
+    // tb16g7(family 0x1A)实测缺陷:SMN 0x59800 读数恒带 RANGE_SEL(bit19),
+    // 旧式 (raw>>21)*0.125 解码虚高 49 C(idle 81 / 载荷 126 / 满载 141)。
+    // 修正采用 Linux k10temp 语义(drivers/hwmon/k10temp.c,"Common for Zen
+    // CPU families (17h/18h/19h/1Ah)"):RANGE_SEL(bit19)=1 或
+    // TJ_SEL([17:16])=0b11 时 -49 C。fixture 直接用 tb16g7 抓到的原始值:
+    //   idle 0x59800 = 0x510B0000 -> 81.0 - 49 = 32.0 C
+    //   21 W 载荷      = 0x7D8B0000 -> 125.5 - 49 = 76.5 C
+    //   17h 老式无标志 raw = 640<<21(0x50000000)-> 80.0 C(不加偏移)
+    {
+        FixtureDriverIo io;
+        io.msr[0xC0010299] = [] { return 14ull << 8; };
+        uint64_t pkg = 0;   // pkg 保帧
+        io.msr[0xC001029B] = [&pkg] { pkg += 32768; return pkg; };
+        io.smn[0x59800] = 0x510B0000u;                    // 实测 idle
+        pd::PlatformInfo info; info.vendor = pd::Vendor::Amd;
+        info.logicalProcessors = 16; info.physicalCores = 8;
+        info.coreLPs = {0, 2, 4, 6, 8, 10, 12, 14};
+        info.family = 0x1A;
+        auto probe = pd::CreateAmdProbe(io, info);
+        pd::Sample s;
+        Expect(probe->readSample(s), "idle temp sample reads");
+        Expect(s.tempC.valid && std::abs(s.tempC.value - 32.0) < 0.01,
+               "RANGE_SEL temp decodes with -49 C (idle 0x510B0000)");
+        io.smn[0x59800] = 0x7D8B0000u;                    // 实测 21 W 载荷
+        pd::Sample s2;
+        Expect(probe->readSample(s2), "load temp sample reads");
+        Expect(s2.tempC.valid && std::abs(s2.tempC.value - 76.5) < 0.01,
+               "RANGE_SEL temp decodes with -49 C (load 0x7D8B0000)");
+    }
+    {
+        // 17h/19h 老式读数:bit19=0 且 TJ_SEL!=11 -> 保持原解码
+        FixtureDriverIo io;
+        io.msr[0xC0010299] = [] { return 14ull << 8; };
+        uint64_t pkg = 0;
+        io.msr[0xC001029B] = [&pkg] { pkg += 32768; return pkg; };
+        io.smn[0x59800] = 640u << 21;                     // 80.0 C,无标志位
+        pd::PlatformInfo info; info.vendor = pd::Vendor::Amd;
+        info.logicalProcessors = 16; info.physicalCores = 8;
+        info.coreLPs = {0, 2, 4, 6, 8, 10, 12, 14};
+        info.family = 0x19;
+        auto probe = pd::CreateAmdProbe(io, info);
+        pd::Sample s;
+        Expect(probe->readSample(s), "legacy temp sample reads");
+        Expect(s.tempC.valid && std::abs(s.tempC.value - 80.0) < 0.01,
+               "no RANGE_SEL keeps the plain 0.125 C decode");
+    }
+}
+
+void TestAmdProbePstateBaseClock() {
+    // tb16g7 实测缺陷:AMD 不实现 CPUID 0x16(读 0)-> 频率恒 NA。基频
+    // 改从 P-state P0(MSR 0xC0010064)CpuFid 解码(AMD PPR CoreCOF 定义,
+    // LibreHardwareMonitor Amd17Cpu.cs 同式实现):
+    //   family 0x1A(Zen5,PPR 57896-B0):CpuFid[11:0] * 5 MHz
+    //     -> fid=0x334(820)→ 820*5 = 4100 MHz(4.1 GHz)
+    //   family 17h/19h(PPR 55570-B1 / PPR 19h Model 70h A0):
+    //     CpuFid[7:0] / CpuDfsId[13:8] * 200 MHz
+    //     -> fid=0xA8(168)/DfsId=8 → 4200 MHz(ZenStates 文档示例:倍频
+    //        42.0x 即 4.2 GHz)
+    {
+        FixtureDriverIo io;
+        io.msr[0xC0010299] = [] { return 14ull << 8; };
+        uint64_t pkg = 0;   // pkg 保帧
+        io.msr[0xC001029B] = [&pkg] { pkg += 32768; return pkg; };
+        io.msr[0xC0010064] = [] { return 0x334ull; };     // Zen5 P0
+        pd::PlatformInfo info; info.vendor = pd::Vendor::Amd;
+        info.logicalProcessors = 16; info.physicalCores = 8;
+        info.coreLPs = {0, 2, 4, 6, 8, 10, 12, 14};
+        info.family = 0x1A; info.baseGHz = 0.0;           // CPUID 0x16 缺席
+        auto probe = pd::CreateAmdProbe(io, info);
+        Expect(std::abs(probe->caps().baseGHz - 4.1) < 0.001,
+               "zen5 base = CpuFid[11:0] * 5 MHz");
+        // ctor 基线期 APERF/MPERF 未脚本化(prev=0);本帧 ΔA=1000,
+        // ΔM=2000 -> 比值 0.5 -> 4.1 * 0.5 = 2.05 GHz
+        uint64_t aperf = 0, mperf = 0;
+        io.msr[0xE8] = [&aperf] { aperf += 1000; return aperf; };
+        io.msr[0xE7] = [&mperf] { mperf += 2000; return mperf; };
+        pd::Sample s;
+        Expect(probe->readSample(s), "zen5 freq sample reads");
+        Expect(s.freqGHz.valid && std::abs(s.freqGHz.value - 2.05) < 0.001,
+               "zen5 freq = P0 base * aperf/mperf ratio");
+    }
+    {
+        FixtureDriverIo io;
+        io.msr[0xC0010299] = [] { return 14ull << 8; };
+        uint64_t pkg = 0;
+        io.msr[0xC001029B] = [&pkg] { pkg += 32768; return pkg; };
+        io.msr[0xC0010064] = [] { return (8ull << 8) | 0xA8ull; };  // 168/8
+        pd::PlatformInfo info; info.vendor = pd::Vendor::Amd;
+        info.logicalProcessors = 8; info.physicalCores = 4;
+        info.coreLPs = {0, 2, 4, 6};
+        info.family = 0x19; info.baseGHz = 0.0;
+        auto probe = pd::CreateAmdProbe(io, info);
+        Expect(std::abs(probe->caps().baseGHz - 4.2) < 0.001,
+               "zen4 base = CpuFid / CpuDfsId * 200 MHz");
+        // 无 P-state(family 0x19 未脚本化 0xC0010064)时保持入口层
+        // baseGHz(0),频率 NA —— 诚实降级
+        FixtureDriverIo io2;
+        io2.msr[0xC0010299] = [] { return 14ull << 8; };
+        uint64_t pkg2 = 0;
+        io2.msr[0xC001029B] = [&pkg2] { pkg2 += 32768; return pkg2; };
+        pd::PlatformInfo info2; info2.vendor = pd::Vendor::Amd;
+        info2.logicalProcessors = 8; info2.physicalCores = 4;
+        info2.coreLPs = {0, 2, 4, 6};
+        info2.family = 0x19; info2.baseGHz = 0.0;
+        auto probe2 = pd::CreateAmdProbe(io2, info2);
+        pd::Sample s2;
+        Expect(probe2->readSample(s2), "no-pstate frame reads");
+        Expect(!s2.freqGHz.valid, "missing P-state leaves freq NA");
+    }
 }
 
 void TestSamplerDrivesSinkAndFillsPlatformIndependentFields() {
@@ -684,6 +853,9 @@ int main() {
     TestAmdProbeEnergyWraparound();
     TestAmdProbeDegradesAndFuses();
     TestAmdProbeCoreFailureBlanksDomainAndRebaselines();
+    TestAmdProbeScansPhysicalCoresOnly();
+    TestAmdProbeTempRangeOffset();
+    TestAmdProbePstateBaseClock();
     TestSamplerDrivesSinkAndFillsPlatformIndependentFields();
     TestSamplerExitsAfterFiveConsecutiveFailures();
 

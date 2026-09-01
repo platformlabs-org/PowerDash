@@ -159,6 +159,51 @@ static pd::Vendor CpuVendor() {
                                            : pd::Vendor::Intel;
 }
 
+/* CPUID.1 family (base + extended, same arithmetic CpuIdLine uses).
+ * The AMD probe consumes it to pick per-generation decodes (P-state
+ * CpuFid layout / SMN semantics changed in family 0x1A). */
+static unsigned CpuFamily() {
+    int info[4] = {};
+    __cpuid(info, 1);
+    return ((info[0] >> 8) & 0xF) + ((info[0] >> 20) & 0xFF);
+}
+
+/* Physical-core topology for the PlatformInfo: every
+ * RelationProcessorCore entry in GetLogicalProcessorInformation's
+ * buffer is exactly one physical core (its ProcessorMask lists that
+ * core's SMT siblings). AMD's per-core energy counter 0xC001029A is
+ * shared by SMT siblings, so the probe must read one LP per physical
+ * core - the representative LP is the mask's lowest set bit. NOTE:
+ * Windows enumerates siblings with ADJACENT numbers (measured on
+ * labs-tb16g7, 8C/16T: masks 0x0003,0x000C,...,0xC000 -> LP pairs
+ * {0,1},{2,3},...), NOT n/n+nCores, so "first nCores LPs" would read
+ * only half the cores twice; the representative list comes from the
+ * actual masks. Returns false on API failure (callers fall back to
+ * logicalProcessors / all-LP scanning). */
+static bool QueryCoreTopology(unsigned& physicalCores,
+                              std::vector<unsigned>& coreLPs) {
+    physicalCores = 0;
+    coreLPs.clear();
+    DWORD bytes = 0;
+    if (GetLogicalProcessorInformation(nullptr, &bytes) ||
+        GetLastError() != ERROR_INSUFFICIENT_BUFFER || bytes == 0)
+        return false;
+    std::vector<SYSTEM_LOGICAL_PROCESSOR_INFORMATION> buf(
+        bytes / sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION));
+    if (!GetLogicalProcessorInformation(buf.data(), &bytes))
+        return false;
+    for (const auto& e : buf) {
+        if (e.Relationship != RelationProcessorCore)
+            continue;
+        ++physicalCores;
+        DWORD_PTR m = e.ProcessorMask;
+        unsigned lp = 0;
+        while (m != 0 && (m & 1) == 0) { m >>= 1; ++lp; }
+        coreLPs.push_back(lp);
+    }
+    return physicalCores > 0;
+}
+
 struct PCICFG_Request {
     ULONG bus, dev, func, reg, bytes;
     ULONG64 write_value;
@@ -493,6 +538,91 @@ static int CmdMode(int argc, char* argv[]) {
     return 1;
 }
 
+/* ============================ smn/msr debug aid ============================
+ * PowerDash --smndbg <hexaddr> - dump one raw SMN register through the
+ * driver's atomic IO_CTL_SMN_READ (same ensure/load/cleanup lifecycle as
+ * the power monitor). Each address is read twice back-to-back and both
+ * raw words are printed: some SMN reads need a priming read before the
+ * data register settles. Debug/b ring-up aid for the AMD SMN map (THM
+ * registers, future PMTable bring-up); not part of the monitoring path.
+ *
+ * PowerDash --msrdbg <core> <hexmsr> - same idea for a per-core MSR:
+ * read twice one second apart so energy counters (0xC001029A/B) show a
+ * visible delta while static registers (P-state defs) repeat verbatim.
+ * Used to map per-LP counters to physical cores on real hardware. */
+
+static int CmdSmnDbg(int argc, char* argv[]) {
+    if (argc != 3) {
+        std::cout << "usage: PowerDash --smndbg <hexaddr>   e.g. --smndbg 0x59800"
+                  << std::endl;
+        return 1;
+    }
+    uint32_t addr = (uint32_t)strtoul(argv[2], nullptr, 16);
+
+    HANDLE hDriver = EnsureDriverLoaded();
+    if (hDriver == INVALID_HANDLE_VALUE) {
+        std::cerr << "Failed to open driver." << std::endl;
+        return 1;
+    }
+    int rc = 0;
+    do {
+        pd::WindowsDriverIo io(hDriver);
+        for (int i = 0; i < 2; ++i) {
+            uint32_t raw = 0;
+            if (io.ReadSmn(addr, raw))
+                std::cout << "SMN 0x" << std::hex << addr << " = 0x"
+                          << std::setw(8) << std::setfill('0') << raw
+                          << std::setfill(' ') << std::dec << std::endl;
+            else {
+                std::cerr << "SMN 0x" << std::hex << addr << std::dec
+                          << " read failed" << std::endl;
+                rc = 2;
+            }
+        }
+    } while (0);
+    CloseHandle(hDriver);
+    RemoveOursDriver();
+    return rc;
+}
+
+static int CmdMsrDbg(int argc, char* argv[]) {
+    if (argc != 4) {
+        std::cout << "usage: PowerDash --msrdbg <core> <hexmsr>   e.g. --msrdbg 0 0xC001029A"
+                  << std::endl;
+        return 1;
+    }
+    const unsigned core = (unsigned)strtoul(argv[2], nullptr, 0);
+    const uint32_t msr = (uint32_t)strtoul(argv[3], nullptr, 16);
+
+    HANDLE hDriver = EnsureDriverLoaded();
+    if (hDriver == INVALID_HANDLE_VALUE) {
+        std::cerr << "Failed to open driver." << std::endl;
+        return 1;
+    }
+    int rc = 0;
+    do {
+        pd::WindowsDriverIo io(hDriver);
+        for (int i = 0; i < 2; ++i) {
+            uint64_t raw = 0;
+            if (io.ReadMsr(core, msr, raw))
+                std::cout << "MSR(core " << core << ") 0x" << std::hex
+                          << std::uppercase << msr << " = 0x" << std::setw(16)
+                          << std::setfill('0') << raw << std::setfill(' ')
+                          << std::nouppercase << std::dec << std::endl;
+            else {
+                std::cerr << "MSR(core " << core << ") 0x" << std::hex
+                          << std::uppercase << msr << std::nouppercase
+                          << std::dec << " read failed" << std::endl;
+                rc = 2;
+            }
+            if (i == 0) Sleep(1000);   /* 1 s apart: deltas become visible */
+        }
+    } while (0);
+    CloseHandle(hDriver);
+    RemoveOursDriver();
+    return rc;
+}
+
 /* ============================ power monitor ============================ */
 
 static int RunMonitor(int argc, char* argv[],
@@ -600,6 +730,14 @@ static int RunMonitor(int argc, char* argv[],
     info.vendor = CpuVendor();
     info.cpuName = cpuLine;
     info.logicalProcessors = std::thread::hardware_concurrency();
+    if (!QueryCoreTopology(info.physicalCores, info.coreLPs) ||
+        info.physicalCores > info.logicalProcessors) {
+        /* API 失败/离谱值兜底:physicalCores = nLP、代表集留空(探针
+         * 退回全 LP 遍历,旧行为) */
+        info.physicalCores = info.logicalProcessors;
+        info.coreLPs.clear();
+    }
+    info.family = CpuFamily();
     info.baseGHz = baseMHz / 1000.0;
     if (info.baseGHz <= 0.0) {
         /* pcm fallback: CPUID 0x16 returns 0 on some parts (observed on
@@ -880,6 +1018,8 @@ int main(int argc, char* argv[]) {
     std::string cmd = argv[1];
     if (cmd == "-h" || cmd == "--help" || cmd == "/?") { Usage(); return 0; }
     if (cmd == "mode")   return CmdMode(argc, argv);
+    if (cmd == "--smndbg") return CmdSmnDbg(argc, argv);
+    if (cmd == "--msrdbg") return CmdMsrDbg(argc, argv);
     if (cmd == "power") {
         std::vector<std::string> args;
         for (int i = 2; i < argc; ++i) args.emplace_back(argv[i]);

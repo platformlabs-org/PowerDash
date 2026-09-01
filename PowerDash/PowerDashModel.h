@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace pd {
 
@@ -60,7 +61,17 @@ struct PlatformInfo {            // CPUID 静态信息,入口层计算后交给�
     Vendor vendor = Vendor::Intel;
     std::string cpuName;         // "brand  [codename]"
     unsigned logicalProcessors = 0;
+    unsigned physicalCores = 0;  // GetLogicalProcessorInformation 统计;0=未知
+                                 // (AMD 0xC001029A 按物理核计数,SMT 兄弟 LP
+                                 //  共享同一计数器,遍历需去重;0 时退回 nLP)
+    std::vector<unsigned> coreLPs;  // 每个物理核一个代表 LP(其 mask 最低
+                                    // 置位位;Windows SMT 兄弟编号相邻,如
+                                    // 8C/16T 为 {0,1}{2,3}…,代表集 =
+                                    // {0,2,4,6,8,10,12,14})。空 = 拓扑未知,
+                                    // 探针退回全 LP 遍历(旧保底行为)。
     double baseGHz = 0.0;        // CPUID 0x16;0=未知
+    unsigned family = 0;         // CPUID family(AMD 探针按世代分 P-state/
+                                 // SMN 解码;Intel 不消费)
 };
 
 struct Decomposition {

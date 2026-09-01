@@ -61,8 +61,45 @@ AMD 平台（CPUID `AuthenticAMD` 自动识别，Ryzen 移动 APU）当前支持
   限值解码列为实测机到位后的后续任务。
 - **CSV v2 语义**：平台不支持的列持续写**空单元格**（不是 0），`platform` 列
   为 `amd`；下游以空单元格区分"平台不支持"与"读数为零"。
-- **实测验收前置**：逐核能量计数器（0xC001029A）按逻辑处理器遍历，若实测发现
-  其按物理核计数（SMT 双计），需改为仅遍历物理核。
+
+### AMD 实测修复记录（labs-tb16g7，Ryzen AI 7 350 / Krackan Point，family 0x1A）
+
+2026-09-01 首轮实测发现的三个缺陷及修法（证据详见当日验收报告）：
+
+1. **逐核能量 SMT 双计**：`0xC001029A` 按物理核计数，SMT 兄弟 LP 共享同一
+   计数器（实测 LP0/LP1 差分速率 877590/868173 raw/s，1% 内相等）。Windows
+   枚举同核兄弟为**相邻** LP（8C/16T 的核 mask 为 0x0003/0x000C/…，即
+   {0,1}{2,3}…，不是 n/n+8），故遍历"前 nCores 个 LP"只会读到一半核 ×2。
+   修复：入口层从 `GetLogicalProcessorInformation` 提取每个物理核 mask 的
+   最低置位 LP 作代表（`PlatformInfo.coreLPs`），探针每核只读一个代表 LP。
+   修后实测：idle IA 0.1-0.6 W，4 烧机载荷 IA 81-84% of PKG（修前 167%）。
+2. **温度虚高 49 C**：family 0x1A 的 SMN 0x59800（Tctl，Linux k10temp：
+   "Common for Zen CPU families (17h/18h/19h/1Ah)"）恒带 RANGE_SEL(bit19)，
+   按 k10temp 语义需 `-49 C`（bit19=1 或 TJ_SEL[17:16]=0b11 时；17h 上该位
+   通常为 0，故旧解码在老平台上恰好正确）。实测 raw idle 0x510B0000 →
+   32 C、21 W 0x7D8B0000 → 76.5 C、52 W → 92.5 C；修前面板读 81/126/141 C。
+3. **频率恒 NA**：AMD 不实现 CPUID 0x16（读 0）。基频改从 P-state P0
+   （MSR 0xC0010064）的 CpuFid 解码：family 0x1A 为 `CpuFid[11:0] * 5 MHz`
+   （PPR 57896-B0 CoreCOF 定义，LibreHardwareMonitor Amd17Cpu.cs 同式），
+   17h/19h 为 `CpuFid[7:0] / CpuDfsId[13:8] * 200`（PPR 55570-B1 / PPR 19h
+   Model 70h，libcpuid/CoreFreq 同式）。实测 P0 raw 0x...C1 90 → fid 0x190
+   → 2.0 GHz，与规格页标称基频一致；修后 FREQ idle ~2.0 GHz、满载 ~4.9 GHz。
+
+能量定标沿用 0xC0010299（RAPL_POWER_UNIT 位兼容 Intel；该机 energy bits=16，
+实测 pkg idle 差分 142119 raw/s = 2.17 W，交叉验证定标正确）。
+
+### SMN/MSR 调试工具（隐藏命令）
+
+```
+PowerDash --smndbg <hexaddr>     读一个 SMN 寄存器原始值（连读两次并打印，
+                                  部分 SMN 读需要一次 priming；如 --smndbg 0x59800）
+PowerDash --msrdbg <core> <hexmsr>  读一个 per-core MSR 原始值（间隔 1 s 连读
+                                  两次，能量计数器的差分可见；如 --msrdbg 0 0xC001029A）
+```
+
+两条命令与 `power` 走同一驱动装卸生命周期（透明安装/退出回收），仅打印
+原始值不做解码——SMN 地图核对与未来 PMTable bring-up 的取证工具，不属于
+监控路径。
 
 ## 单 exe 无感驱动装卸
 

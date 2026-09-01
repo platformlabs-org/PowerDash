@@ -1,9 +1,12 @@
 #pragma once
-
+// PowerDashUi.h —— 面板渲染与 CSV 写入,只消费统一模型(Sample v2 +
+// PlatformCaps,见 PowerDashModel.h)。平台差异经 caps 控制区块显隐,
+// 渲染层不出现任何 MSR/平台寄存器概念(spec 第 2/5 节)。
 #include <cstddef>
-#include <cstdint>
 #include <string>
 #include <vector>
+
+#include "PowerDashModel.h"
 
 namespace pd {
 
@@ -12,37 +15,11 @@ struct MonitorOptions {
     std::string csvPath;
 };
 
-struct PowerSample {
-    std::string timestamp;
-    double elapsedSeconds = 0.0;
-    double pkgPower = 0.0;
-    double iaPower = 0.0;
-    double gtPower = 0.0;
-    double sysPower = 0.0;
-    double pl1Watt = 0.0;
-    double pl2Watt = 0.0;
-    std::string pl1Window;
-    std::string pl2Window;
-    bool plLocked = false;
-    int tempC = -1;
-    double freqGHz = 0.0;
-    double c0Pct = 0.0;
-    double c2Pct = 0.0;
-    double c6Pct = 0.0;
-    double utilPct = 0.0;
-    std::uint64_t smiDelta = 0;
-    std::string mode = "n/a";
-};
-
-struct DashboardInfo {
+struct DashboardInfo {             // 平台无关的展示上下文
     std::string version;
     std::string cpuBrand;
     std::string codeName;
-    unsigned logicalProcessors = 0;
-    double baseGHz = 0.0;
-    int tjMaxC = 0;
     int width = 80;
-    double fallbackScaleW = 60.0;
     bool csvActive = false;
     std::string csvName;
     bool ansi = false;
@@ -50,12 +27,13 @@ struct DashboardInfo {
 
 bool ParsePowerArguments(const std::vector<std::string>& args,
                          MonitorOptions& options, std::string& error);
-std::string CsvHeader();
-std::string CsvRow(const PowerSample& sample);
+std::string CsvHeader();           // CSV v2 列(spec 第 6 节)
+std::string CsvRow(Vendor vendor, const Sample& sample);
 std::size_t VisibleLength(const std::string& text);
 std::string RenderLogo(int width, bool ansi);
 std::string RenderDashboard(const DashboardInfo& info,
-                            const PowerSample& sample,
+                            const PlatformCaps& caps,
+                            const Sample& sample,
                             const std::vector<double>& history);
 
 } // namespace pd

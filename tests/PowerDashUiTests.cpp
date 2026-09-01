@@ -58,34 +58,41 @@ void TestPowerArgumentsRejectMissingCsvPathAndInvalidDuration() {
 
 void TestCsvHasStableColumnsAndEscapesText() {
     const std::string expectedHeader =
-        "timestamp,elapsed_s,pkg_w,ia_w,gt_w,sys_w,pl1_w,pl2_w,"
-        "temp_c,freq_ghz,c0_pct,c2_pct,c6_pct,util_pct,smi_delta,mode";
+        "timestamp,elapsed_s,platform,pkg_w,cores_w,gfx_w,platform_w,"
+        "limit_sustained_w,limit_sustained_window_s,limit_burst_w,limit_locked,"
+        "tdc_a,edc_a,temp_c,freq_ghz,util_pct,c0_pct,c2_pct,c6_pct,smi_delta,mode";
     Expect(pd::CsvHeader() == expectedHeader, "CSV header columns changed");
 
-    pd::PowerSample sample;
+    pd::Sample sample;                        // v2 fixture: gfx/tdc/edc invalid
     sample.timestamp = "2026-09-01T12:34:56";
-    sample.elapsedSeconds = 1.0;
-    sample.pkgPower = 12.345;
-    sample.iaPower = 8.5;
-    sample.gtPower = 0.25;
-    sample.sysPower = 1.75;
-    sample.pl1Watt = 28.0;
-    sample.pl2Watt = 45.0;
-    sample.tempC = 67;
-    sample.freqGHz = 3.125;
-    sample.c0Pct = 42.0;
-    sample.c2Pct = 18.0;
-    sample.c6Pct = 40.0;
-    sample.utilPct = 7.5;
+    sample.elapsedS = 1.0;
+    sample.pkgW = pd::Ok(12.345);
+    sample.coresW = pd::Ok(8.5);
+    sample.gfxW = pd::NA();
+    sample.platformW = pd::Ok(1.75);
+    sample.powerLimit.sustainedW = pd::Ok(28.0);
+    sample.powerLimit.sustainedWindowS = pd::Ok(0.002);
+    sample.powerLimit.burstW = pd::Ok(45.0);
+    sample.powerLimit.locked = true;
+    sample.currentLimit.tdcA = pd::NA();
+    sample.currentLimit.edcA = pd::NA();
+    sample.tempC = pd::Ok(67);
+    sample.freqGHz = pd::Ok(3.125);
+    sample.utilPct = pd::Ok(7.5);
+    sample.c0Pct = pd::Ok(42.0);
+    sample.c2Pct = pd::Ok(18.0);
+    sample.c6Pct = pd::Ok(40.0);
     sample.smiDelta = 2;
     sample.mode = "Intelligent, Auto";
 
     const std::string expectedRow =
-        "2026-09-01T12:34:56,1.000,12.345,8.500,0.250,1.750,"
-        "28.000,45.000,67,3.125,42.000,18.000,40.000,7.500,2,"
+        "2026-09-01T12:34:56,1.000,intel,12.345,8.500,,1.750,"
+        "28.000,0.002,45.000,1,,,67,3.125,7.500,"
+        "42.000,18.000,40.000,2,"
         "\"Intelligent, Auto\"";
-    Expect(pd::CsvRow(sample) == expectedRow,
-           "CSV row should preserve precision and quote commas");
+    Expect(pd::CsvRow(pd::Vendor::Intel, sample) == expectedRow,
+           "CSV row should preserve precision, blank invalid cells and "
+           "quote commas");
 }
 
 void TestLogoIsCenteredAndColorDoesNotChangeItsWidth() {
@@ -117,9 +124,6 @@ pd::DashboardInfo DashboardFixture(int width, bool ansi = false) {
     info.version = "1.0";
     info.cpuBrand = "Intel Core Ultra 7 258V";
     info.codeName = "Lunar Lake";
-    info.logicalProcessors = 8;
-    info.baseGHz = 2.0;
-    info.tjMaxC = 100;
     info.width = width;
     info.csvActive = true;
     info.csvName = "capture.csv";
@@ -127,24 +131,39 @@ pd::DashboardInfo DashboardFixture(int width, bool ansi = false) {
     return info;
 }
 
-pd::PowerSample SampleFixture() {
-    pd::PowerSample sample;
-    sample.elapsedSeconds = 92;
-    sample.pkgPower = 18.5;
-    sample.iaPower = 12.0;
-    sample.gtPower = 0.5;
-    sample.sysPower = 25.0;
-    sample.pl1Watt = 28.0;
-    sample.pl2Watt = 45.0;
-    sample.pl1Window = "28.00 s";
-    sample.pl2Window = "2.00 ms";
-    sample.plLocked = true;
-    sample.tempC = 64;
-    sample.freqGHz = 3.2;
-    sample.c0Pct = 35;
-    sample.c2Pct = 15;
-    sample.c6Pct = 50;
-    sample.utilPct = 8;
+pd::PlatformCaps IntelCapsFixture() {
+    pd::PlatformCaps caps;
+    caps.vendor = pd::Vendor::Intel;
+    caps.cpuName = "Intel Core Ultra 7 258V  [Lunar Lake]";
+    caps.gfxPower = true;
+    caps.platformPower = true;
+    caps.powerLimits = true;
+    caps.residency = true;
+    caps.smi = true;
+    caps.budgetW = 0.0;
+    caps.tjMaxC = 100;
+    caps.baseGHz = 2.0;
+    caps.logicalProcessors = 8;
+    return caps;
+}
+
+pd::Sample SampleFixture() {
+    pd::Sample sample;
+    sample.elapsedS = 92;
+    sample.pkgW = pd::Ok(18.5);
+    sample.coresW = pd::Ok(12.0);
+    sample.gfxW = pd::Ok(0.5);
+    sample.platformW = pd::Ok(25.0);
+    sample.powerLimit.sustainedW = pd::Ok(28.0);
+    sample.powerLimit.burstW = pd::Ok(45.0);
+    sample.powerLimit.sustainedWindowS = pd::Ok(28.0);   // 28.00 s
+    sample.powerLimit.locked = true;
+    sample.tempC = pd::Ok(64);
+    sample.freqGHz = pd::Ok(3.2);
+    sample.c0Pct = pd::Ok(35);
+    sample.c2Pct = pd::Ok(15);
+    sample.c6Pct = pd::Ok(50);
+    sample.utilPct = pd::Ok(8);
     sample.smiDelta = 1;
     sample.mode = "Intelligent (STD)";
     return sample;
@@ -164,6 +183,7 @@ void ExpectEveryLineHasWidth(const std::string& frame, std::size_t width,
 
 void TestWideDashboardBalancesAtAGlanceAndDiagnosticInformation() {
     const std::string frame = pd::RenderDashboard(DashboardFixture(96),
+                                                   IntelCapsFixture(),
                                                    SampleFixture(),
                                                    {12.0, 18.5});
     Expect(frame.find("░█▀█░█▀█░█░█░█▀▀") != std::string::npos,
@@ -226,6 +246,7 @@ void TestWideDashboardBalancesAtAGlanceAndDiagnosticInformation() {
 
 void TestNarrowDashboardStacksGroupsWithoutDroppingMetrics() {
     const std::string frame = pd::RenderDashboard(DashboardFixture(72),
+                                                   IntelCapsFixture(),
                                                    SampleFixture(),
                                                    {12.0, 18.5});
     for (const char* required : {"SYSTEM POWER", "POWER DOMAINS",
@@ -255,6 +276,7 @@ void TestNarrowDashboardStacksGroupsWithoutDroppingMetrics() {
 
 void TestAnsiColorsPreserveDashboardGeometry() {
     const std::string frame = pd::RenderDashboard(DashboardFixture(96, true),
+                                                   IntelCapsFixture(),
                                                    SampleFixture(),
                                                    {12.0, 18.5});
     Expect(frame.find("\x1b[38;2;103;232;249m") != std::string::npos,

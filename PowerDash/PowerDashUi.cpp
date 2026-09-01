@@ -98,6 +98,22 @@ std::string FormatElapsed(double seconds) {
     return out.str();
 }
 
+/* RAPL tau presentation, identical to the original PowerDash.cpp fmtTau:
+ * >= 1 s -> "x.xx s", >= 1 ms -> "x.xx ms", else "x.xx us". The
+ * rawTau == 0 -> "n/a" case is expressed by an invalid Reading at the
+ * call site (window text then stays "n/a"). */
+std::string FormatWindow(double seconds) {
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(2);
+    if (seconds >= 1.0)
+        out << seconds << " s";
+    else if (seconds >= 0.001)
+        out << seconds * 1e3 << " ms";
+    else
+        out << seconds * 1e6 << " us";
+    return out.str();
+}
+
 std::string ModeColor(bool ansi, const std::string& mode) {
     if (mode.find("Performance") != std::string::npos)
         return Color(ansi, YELLOW, mode);
@@ -161,30 +177,40 @@ bool ParsePowerArguments(const std::vector<std::string>& args,
 }
 
 std::string CsvHeader() {
-    return "timestamp,elapsed_s,pkg_w,ia_w,gt_w,sys_w,pl1_w,pl2_w,"
-           "temp_c,freq_ghz,c0_pct,c2_pct,c6_pct,util_pct,smi_delta,mode";
+    return "timestamp,elapsed_s,platform,pkg_w,cores_w,gfx_w,platform_w,"
+           "limit_sustained_w,limit_sustained_window_s,limit_burst_w,limit_locked,"
+           "tdc_a,edc_a,temp_c,freq_ghz,util_pct,c0_pct,c2_pct,c6_pct,smi_delta,mode";
 }
 
-std::string CsvRow(const PowerSample& sample) {
+/* CSV v2: invalid Reading -> EMPTY cell (never "0"), limit_locked 0/1,
+ * platform in {intel, amd} (spec section 6). */
+std::string CsvRow(Vendor vendor, const Sample& sample) {
+    auto cell = [](const Reading& r, int precision) {
+        return r.valid ? Fixed(r.value, precision) : std::string();
+    };
     std::ostringstream out;
     out << CsvEscape(sample.timestamp)
-        << ',' << Fixed(sample.elapsedSeconds, 3)
-        << ',' << Fixed(sample.pkgPower, 3)
-        << ',' << Fixed(sample.iaPower, 3)
-        << ',' << Fixed(sample.gtPower, 3)
-        << ',' << Fixed(sample.sysPower, 3)
-        << ',' << Fixed(sample.pl1Watt, 3)
-        << ',' << Fixed(sample.pl2Watt, 3)
+        << ',' << Fixed(sample.elapsedS, 3)
+        << ',' << (vendor == Vendor::Amd ? "amd" : "intel")
+        << ',' << cell(sample.pkgW, 3)
+        << ',' << cell(sample.coresW, 3)
+        << ',' << cell(sample.gfxW, 3)
+        << ',' << cell(sample.platformW, 3)
+        << ',' << cell(sample.powerLimit.sustainedW, 3)
+        << ',' << cell(sample.powerLimit.sustainedWindowS, 3)
+        << ',' << cell(sample.powerLimit.burstW, 3)
+        << ',' << (sample.powerLimit.locked ? 1 : 0)
+        << ',' << cell(sample.currentLimit.tdcA, 3)
+        << ',' << cell(sample.currentLimit.edcA, 3)
+        << ',' << cell(sample.tempC, 0)
+        << ',' << cell(sample.freqGHz, 3)
+        << ',' << cell(sample.utilPct, 3)
+        << ',' << cell(sample.c0Pct, 3)
+        << ',' << cell(sample.c2Pct, 3)
+        << ',' << cell(sample.c6Pct, 3)
         << ',';
-    if (sample.tempC >= 0) out << sample.tempC;
-    out << ',';
-    if (sample.freqGHz > 0.0) out << Fixed(sample.freqGHz, 3);
-    out << ',' << Fixed(sample.c0Pct, 3)
-        << ',' << Fixed(sample.c2Pct, 3)
-        << ',' << Fixed(sample.c6Pct, 3)
-        << ',' << Fixed(sample.utilPct, 3)
-        << ',' << sample.smiDelta
-        << ',' << CsvEscape(sample.mode);
+    if (sample.smiDelta.has_value()) out << *sample.smiDelta;
+    out << ',' << CsvEscape(sample.mode);
     return out.str();
 }
 
@@ -235,8 +261,10 @@ std::string RenderLogo(int width, bool ansi) {
 }
 
 std::string RenderDashboard(const DashboardInfo& info,
-                            const PowerSample& sample,
+                            const PlatformCaps& caps,
+                            const Sample& sample,
                             const std::vector<double>& history) {
+    const bool intel = caps.vendor != Vendor::Amd;
     const int width = std::max(72, std::min(info.width, 120));
     const std::size_t inner = static_cast<std::size_t>(width - 2);
     const bool wide = width >= 92;
@@ -283,7 +311,7 @@ std::string RenderDashboard(const DashboardInfo& info,
     };
 
     lines.push_back(border);
-    const std::string elapsed = FormatElapsed(sample.elapsedSeconds);
+    const std::string elapsed = FormatElapsed(sample.elapsedS);
     const std::string versionMode = " v" + info.version + "  Mode: " +
                                     ModeColor(info.ansi, sample.mode);
     const std::string timing = Color(info.ansi, MUTED,
@@ -302,31 +330,38 @@ std::string RenderDashboard(const DashboardInfo& info,
 
     std::string cpu = " " + info.cpuBrand;
     if (!info.codeName.empty()) cpu += "  [" + info.codeName + "]";
-    std::string cpuFacts = std::to_string(info.logicalProcessors) + " LPs";
-    if (info.baseGHz > 0.0)
-        cpuFacts += "  Base " + Fixed(info.baseGHz, 2) + " GHz";
+    std::string cpuFacts = std::to_string(caps.logicalProcessors) + " LPs";
+    if (caps.baseGHz > 0.0)
+        cpuFacts += "  Base " + Fixed(caps.baseGHz, 2) + " GHz";
     row(JoinSides(cpu, Color(info.ansi, MUTED, cpuFacts + " "), inner));
 
-    /* RAPL hierarchy: PSYS ("SYSTEM") = PKG + off-package platform share
-     * (memory, PCH, VR losses). The two bars decompose SYSTEM so their sum
-     * always equals the title value; without a PSYS reading, REST falls
-     * back to the package's internal remainder (PKG - IA - GT). Both bars
-     * share one scale (0 .. PL2, or the thermal-spec fallback) and the
-     * legend names the scale, the PL1 marker and the identity. */
-    const bool psysKnown = sample.sysPower > 0.0;
-    section(psysKnown
-                ? "SYSTEM POWER · " + Fixed(sample.sysPower, 2) + " W"
-                : "SYSTEM POWER");
-    const double scale = sample.pl2Watt > 0.0 ? sample.pl2Watt
-                       : (info.fallbackScaleW > 0.0 ? info.fallbackScaleW
-                                                    : 60.0);
-    const std::string scaleName = sample.pl2Watt > 0.0 ? "PL2" : "spec";
-    const double fraction = std::max(0.0, sample.pkgPower / scale);
-    const double restPower = psysKnown
-        ? std::max(0.0, sample.sysPower - sample.pkgPower)
-        : std::max(0.0, sample.pkgPower - sample.iaPower - sample.gtPower);
-    const double restPkgPct = sample.pkgPower > 0.0
-        ? restPower / sample.pkgPower * 100.0 : 0.0;
+    /* Power hierarchy via Decompose (spec section 5): the two bars decompose
+     * the title total so their sum always equals it - Intel PSYS
+     * ("SYSTEM" = PKG + off-package platform share) or, without a platform
+     * reading, the package's internal remainder (PKG - CORES - GFX). Both
+     * bars share one scale (0 .. burst limit, or the budget/spec fallback)
+     * and the legend names the scale, the sustained marker and the identity. */
+    const Decomposition d = Decompose(sample, caps);
+    section(d.totalW.valid
+                ? d.title + " · " + Fixed(d.totalW.value, 2) + " W"
+                : (caps.platformPower ? "SYSTEM POWER" : "PACKAGE POWER"));
+    const bool sysDecomposition = caps.platformPower &&
+        sample.platformW.valid && sample.pkgW.valid;
+    const double mainPower = d.mainW.valid ? d.mainW.value : 0.0;
+    const double restPower = d.restW.valid ? d.restW.value : 0.0;
+    /* burst == 0 (register reads zero) keeps the v1 "not known" handling:
+     * fall to the probe budget or the 60 W spec default */
+    const bool burstKnown = sample.powerLimit.burstW.valid &&
+                            sample.powerLimit.burstW.value > 0.0;
+    const double scale = burstKnown ? sample.powerLimit.burstW.value
+                       : (caps.budgetW > 0.0 ? caps.budgetW : 60.0);
+    const std::string scaleName = burstKnown
+        ? (intel ? "PL2" : "FPPT") : std::string("spec");
+    const double sustainedW = sample.powerLimit.sustainedW.valid
+        ? sample.powerLimit.sustainedW.value : 0.0;
+    const double fraction = std::max(0.0, mainPower / scale);
+    const double restPkgPct = mainPower > 0.0
+        ? restPower / mainPower * 100.0 : 0.0;
 
     /* fixed fields keep both bars the same length: " PKG    "/" REST   "
      * (8), right-aligned watt value (9), trailer (11: "100% of PL2") */
@@ -352,7 +387,7 @@ std::string RenderDashboard(const DashboardInfo& info,
         int marker = -1;
         if (withMarker) {
             marker = static_cast<int>(
-                sample.pl1Watt / scale * barWidth + 0.5);
+                sustainedW / scale * barWidth + 0.5);
             marker = std::max(0, std::min(marker, barWidth - 1));
         }
         std::string bar = Color(info.ansi, BORDER, "[");
@@ -366,36 +401,40 @@ std::string RenderDashboard(const DashboardInfo& info,
         }
         return bar + Color(info.ansi, BORDER, "]");
     };
-    const char* pkgColor = sample.pkgPower > scale ? RED
-                        : (sample.pkgPower > sample.pl1Watt &&
-                           sample.pl1Watt > 0.0 ? YELLOW : GREEN);
-    row(" PKG    " + valueField(sample.pkgPower) + "  " +
-        powerBar(sample.pkgPower, pkgColor, true) + "  " +
-        padLeft(SeverityColor(info.ansi, sample.pkgPower,
-            sample.pl1Watt > 0.0 ? sample.pl1Watt : scale,
+    const char* pkgColor = mainPower > scale ? RED
+                        : (mainPower > sustainedW &&
+                           sustainedW > 0.0 ? YELLOW : GREEN);
+    row(" PKG    " + valueField(mainPower) + "  " +
+        powerBar(mainPower, pkgColor, true) + "  " +
+        padLeft(SeverityColor(info.ansi, mainPower,
+            sustainedW > 0.0 ? sustainedW : scale,
             scale, Fixed(fraction * 100.0, 0) + "% of " + scaleName),
             trailerField));
     row(" REST   " + valueField(restPower) + "  " +
         powerBar(restPower, CYAN, false) + "  " +
-        padLeft(psysKnown
-                    ? Fixed(restPower / sample.sysPower * 100.0, 0) +
+        padLeft(sysDecomposition && d.totalW.value > 0.0
+                    ? Fixed(restPower / d.totalW.value * 100.0, 0) +
                           "% of SYS"
                     : Fixed(restPkgPct, 0) + "% of PKG",
                 trailerField));
     row(JoinSides("  0 W",
         "scale to " +
             Color(info.ansi, RED, scaleName + " " + Fixed(scale, 2) + " W") +
-            "  ·  " +
-            Color(info.ansi, YELLOW,
-                  "| = PL1 " + Fixed(sample.pl1Watt, 2) + " W") +
-            (psysKnown ? "  ·  PKG + REST = SYSTEM" : "") + " ",
+            (sample.powerLimit.sustainedW.valid
+                ? "  ·  " + Color(info.ansi, YELLOW,
+                      "| = " + std::string(intel ? "PL1" : "PPT") + " " +
+                      Fixed(sustainedW, 2) + " W")
+                : "") +
+            (!d.identity.empty() ? "  ·  " + d.identity : "") + " ",
         inner));
 
-    /* IA/GT are parts of PKG (share of package); SYSTEM is the PSYS
-     * platform superset that contains PKG, so it is annotated with PKG's
-     * share of it instead of a % of PKG. REST OF PKG lives above, as a bar */
+    /* CORES/GFX are parts of PKG (share of package); SYSTEM is the platform
+     * superset that contains PKG, so it is annotated with PKG's share of it
+     * instead of a % of PKG. REST OF PKG lives above, as a bar. Rows for
+     * unsupported/unreadable domains are hidden entirely (spec rule 3). */
+    const double pkgBase = sample.pkgW.valid ? sample.pkgW.value : 0.0;
     const auto domainPct = [&](double value) {
-        return sample.pkgPower > 0.0 ? value / sample.pkgPower * 100.0 : 0.0;
+        return pkgBase > 0.0 ? value / pkgBase * 100.0 : 0.0;
     };
     auto pctOfPkg = [&](double value) {
         std::string p = Fixed(domainPct(value), 0);
@@ -406,60 +445,131 @@ std::string RenderDashboard(const DashboardInfo& info,
         return " " + label + std::string(13 - label.size(), ' ') +
                Fixed(watt, 2) + " W  " + pct;
     };
-    const std::string ia = domainRow("IA", sample.iaPower,
-                                     pctOfPkg(sample.iaPower));
-    const std::string gt = domainRow("GT", sample.gtPower,
-                                     pctOfPkg(sample.gtPower));
-    std::string sys = " SYSTEM       " + Fixed(sample.sysPower, 2) + " W";
-    if (sample.sysPower > 0.0)
-        sys += "  PKG " + Fixed(sample.pkgPower / sample.sysPower * 100.0, 0) +
+    const bool showCores = sample.coresW.valid;
+    const bool showGfx = caps.gfxPower && sample.gfxW.valid;
+    const bool showSystem = caps.platformPower && sample.platformW.valid;
+    const std::string ia = domainRow("IA", sample.coresW.value,
+                                     pctOfPkg(sample.coresW.value));
+    const std::string gt = domainRow("GT", sample.gfxW.value,
+                                     pctOfPkg(sample.gfxW.value));
+    std::string sys = " SYSTEM       " + Fixed(sample.platformW.value, 2) + " W";
+    if (showSystem)
+        sys += "  PKG " + Fixed(pkgBase / sample.platformW.value * 100.0, 0) +
                "% of SYS";
+    const double utilPct = sample.utilPct.valid ? sample.utilPct.value : 0.0;
     const int utilFill = std::min(20, std::max(0,
-        static_cast<int>(sample.utilPct / 5.0 + 0.5)));
+        static_cast<int>(utilPct / 5.0 + 0.5)));
     const std::string utilGauge = "[" + std::string(utilFill, '#') +
                                   std::string(20 - utilFill, '.') + "]";
-    const std::string util = " UTIL  " + Fixed(sample.utilPct, 0) + "%  " +
-        SeverityColor(info.ansi, sample.utilPct, 80.0, 95.0, utilGauge);
-    const std::string tempValue = sample.tempC >= 0
-        ? SeverityColor(info.ansi, sample.tempC, 80.0, 95.0,
-                        std::to_string(sample.tempC) + " C")
+    const std::string util = " UTIL  " + Fixed(utilPct, 0) + "%  " +
+        SeverityColor(info.ansi, utilPct, 80.0, 95.0, utilGauge);
+    const std::string tempValue = sample.tempC.valid
+        ? SeverityColor(info.ansi, sample.tempC.value, 80.0, 95.0,
+                        Fixed(sample.tempC.value, 0) + " C")
         : Color(info.ansi, MUTED, "N/A");
     std::string temp = " TEMP  " + tempValue;
-    if (info.tjMaxC > 0) temp += " / TjMax " + std::to_string(info.tjMaxC) + " C";
-    const std::string freq = " FREQ  " + (sample.freqGHz > 0.0
-        ? Color(info.ansi, CYAN, Fixed(sample.freqGHz, 2) + " GHz")
+    if (caps.tjMaxC > 0) temp += " / TjMax " + std::to_string(caps.tjMaxC) + " C";
+    const std::string freq = " FREQ  " + (sample.freqGHz.valid
+        ? Color(info.ansi, CYAN, Fixed(sample.freqGHz.value, 2) + " GHz")
         : Color(info.ansi, MUTED, "N/A"));
 
-    std::string limits1 = " PL1 " + Fixed(sample.pl1Watt, 2) + " W";
-    if (!sample.pl1Window.empty()) limits1 += " / " + sample.pl1Window;
-    std::string limits2 = " PL2 " + Fixed(sample.pl2Watt, 2) + " W";
-    if (!sample.pl2Window.empty()) limits2 += " / " + sample.pl2Window;
-    if (sample.plLocked) limits2 += "  LOCKED";
-    const std::string residency = " C0 " + Fixed(sample.c0Pct, 0) +
-        "%   C2 " + Fixed(sample.c2Pct, 0) + "%   C6+ " +
-        Fixed(sample.c6Pct, 0) + "%";
-    const std::string smi = " SMI +" + std::to_string(sample.smiDelta);
+    /* POWER LIMITS: Intel two rows (PL1/PL2 + tau + LOCKED); AMD three rows
+     * (PPT/FPPT, TDC, EDC) with explicit inline units (spec rule 4). The
+     * sustained tau stays "n/a" when the window Reading is invalid, exactly
+     * like the original fmtTau(0). */
+    std::vector<std::string> limitRows;
+    if (caps.powerLimits) {
+        const std::string tauText =
+            sample.powerLimit.sustainedWindowS.valid
+                ? FormatWindow(sample.powerLimit.sustainedWindowS.value)
+                : std::string("n/a");
+        const double burstW = sample.powerLimit.burstW.valid
+            ? sample.powerLimit.burstW.value : 0.0;
+        if (intel) {
+            limitRows.push_back(
+                " PL1 " + Fixed(sustainedW, 2) + " W / " + tauText);
+            limitRows.push_back(
+                " PL2 " + Fixed(burstW, 2) + " W" +
+                (sample.powerLimit.locked ? "  LOCKED" : ""));
+        } else {
+            std::string ppt = " PPT " + Fixed(sustainedW, 2) + " W";
+            if (sample.powerLimit.burstW.valid)
+                ppt += "  FPPT " + Fixed(burstW, 2) + " W";
+            limitRows.push_back(ppt);
+            if (sample.currentLimit.tdcA.valid)
+                limitRows.push_back(
+                    " TDC " + Fixed(sample.currentLimit.tdcA.value, 2) + " A");
+            if (sample.currentLimit.edcA.valid)
+                limitRows.push_back(
+                    " EDC " + Fixed(sample.currentLimit.edcA.value, 2) + " A");
+        }
+    }
+
+    const std::string residency = " C0 " +
+        Fixed(sample.c0Pct.valid ? sample.c0Pct.value : 0.0, 0) +
+        "%   C2 " + Fixed(sample.c2Pct.valid ? sample.c2Pct.value : 0.0, 0) +
+        "%   C6+ " +
+        Fixed(sample.c6Pct.valid ? sample.c6Pct.value : 0.0, 0) + "%";
+    const std::string smi = " SMI +" +
+        std::to_string(sample.smiDelta.value_or(0));
 
     if (wide) {
         pairedSection("POWER DOMAINS", "THERMAL / PERFORMANCE");
-        twoColumns(ia, util);
-        twoColumns(gt, temp);
-        twoColumns(sys, freq);
-        pairedSection("CPU RESIDENCY", "POWER LIMITS");
-        twoColumns(residency, limits1);
-        twoColumns(smi, limits2);
+        const std::vector<std::string> domains = {
+            showCores ? ia : std::string(), showGfx ? gt : std::string(),
+            showSystem ? sys : std::string()};
+        const std::vector<std::string> thermo = {util, temp, freq};
+        std::size_t pair = 0;
+        for (; pair < domains.size() && pair < thermo.size(); ++pair)
+            if (domains[pair].empty()) row(thermo[pair]);
+            else twoColumns(domains[pair], thermo[pair]);
+        for (; pair < domains.size(); ++pair)
+            if (!domains[pair].empty()) row(domains[pair]);
+        for (; pair < thermo.size(); ++pair) row(thermo[pair]);
+
+        /* paired section degrades to a single full-width section when the
+         * platform has no residency metrics (AMD): limits render alone */
+        const std::vector<std::string> resLeft = {
+            caps.residency ? residency : std::string(),
+            caps.smi && sample.smiDelta.has_value() ? smi : std::string()};
+        if (!resLeft[0].empty() || !resLeft[1].empty()) {
+            if (limitRows.empty()) {
+                section("CPU RESIDENCY");
+            } else {
+                pairedSection("CPU RESIDENCY", "POWER LIMITS");
+            }
+        } else if (!limitRows.empty()) {
+            section("POWER LIMITS");
+        }
+        std::size_t limitPair = 0;
+        for (const std::string& left : resLeft) {
+            if (left.empty()) continue;
+            if (limitPair < limitRows.size()) {
+                twoColumns(left, limitRows[limitPair++]);
+            } else {
+                row(left);
+            }
+        }
+        for (; limitPair < limitRows.size(); ++limitPair)
+            row(limitRows[limitPair]);
     } else {
         section("POWER DOMAINS");
-        row(ia + "    " + gt);
-        row(sys);
+        if (showCores && showGfx) row(ia + "    " + gt);
+        else if (showCores) row(ia);
+        else if (showGfx) row(gt);
+        if (showSystem) row(sys);
         section("THERMAL / PERFORMANCE");
         row(util);
         row(temp + "    " + freq);
-        section("CPU RESIDENCY");
-        row(residency + "    " + smi);
-        section("POWER LIMITS");
-        row(limits1);
-        row(limits2);
+        if (caps.residency) {
+            section("CPU RESIDENCY");
+            row(caps.smi && sample.smiDelta.has_value()
+                    ? residency + "    " + smi : residency);
+        }
+        if (!limitRows.empty()) {
+            section("POWER LIMITS");
+            for (const std::string& limit : limitRows) row(limit);
+        }
     }
 
     section("PACKAGE HISTORY · 60 s");

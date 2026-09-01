@@ -24,8 +24,27 @@ Pkg 与 Rest-of-System（PSYS − PKG，封装外的内存/板级损耗）双内
 非 VT 输出自动移除颜色。
 
 `--csv` 可与秒数交换位置，例如 `PowerDash power --csv capture.csv 60`。
-文件在启动时创建或覆盖，字段包含时间戳、运行时间、Pkg/IA/GT/Sys、PL1/PL2、
-温度、频率、C0/C2/C6 驻留率、CPU 利用率、SMI 增量和当前模式；不指定秒数时持续记录到 Ctrl+C。
+文件在启动时创建或覆盖；不指定秒数时持续记录到 Ctrl+C。CSV 为 v2 宽表
+（union 列 + `platform` 列）：无效读数（平台不支持或本帧读取失败）写**空单元格**
+（不是 0），`limit_locked` 为 0/1，`platform ∈ {intel, amd}`，列名单位后缀化：
+
+```
+timestamp,elapsed_s,platform,pkg_w,cores_w,gfx_w,platform_w,
+limit_sustained_w,limit_sustained_window_s,limit_burst_w,limit_locked,
+tdc_a,edc_a,temp_c,freq_ghz,util_pct,c0_pct,c2_pct,c6_pct,smi_delta,mode
+```
+
+v1 → v2 迁移表：
+
+| v1 列 | v2 列 |
+|---|---|
+| pkg_w | pkg_w(不变) |
+| ia_w | cores_w |
+| gt_w | gfx_w |
+| sys_w | platform_w |
+| pl1_w / pl2_w | limit_sustained_w / limit_burst_w |
+| (无) | limit_sustained_window_s, tdc_a, edc_a, platform, limit_locked |
+| c0/c2/c6_pct, smi_delta, mode, temp_c, freq_ghz, util_pct | 同名保留 |
 
 ## 单 exe 无感驱动装卸
 

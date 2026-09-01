@@ -704,16 +704,6 @@ static int RunMonitor(int argc, char* argv[],
     };
     int W = pickDashboardWidth();
     int lastConsoleColumns = consoleColumns();
-    auto fmtTau = [&](uint64_t rawTau) {   /* RAPL time units -> seconds */
-        if (rawTau == 0) return std::string("n/a");
-        double s = rawTau * time_unit;
-        std::ostringstream o;
-        o << std::fixed << std::setprecision(2);
-        if      (s >= 1)     o << s       << " s";
-        else if (s >= 0.001) o << s * 1e3 << " ms";
-        else                 o << s * 1e6 << " us";
-        return o.str();
-    };
 
     if (vtOn) std::cout << "\x1b[?25l" << std::flush;   /* hide cursor */
 
@@ -731,11 +721,7 @@ static int RunMonitor(int argc, char* argv[],
     dashboardInfo.version = PD_VER;
     dashboardInfo.cpuBrand = brand;
     dashboardInfo.codeName = codeTag;
-    dashboardInfo.logicalProcessors = nLP;
-    dashboardInfo.baseGHz = baseMHz / 1000.0;
-    dashboardInfo.tjMaxC = tjMaxC;
     dashboardInfo.width = W;
-    dashboardInfo.fallbackScaleW = thermal_spec_power;
     dashboardInfo.csvActive = csv.is_open();
     if (dashboardInfo.csvActive) {
         const size_t slash = monitorOptions.csvPath.find_last_of("\\/");
@@ -744,6 +730,22 @@ static int RunMonitor(int argc, char* argv[],
                               : monitorOptions.csvPath.substr(slash + 1);
     }
     dashboardInfo.ansi = vtOn;
+
+    /* Task 6 将移除的 v1→v2 适配:本循环仍是 Intel v1 局部量,在此把它们
+     * 拼成 PlatformCaps(静态事实,原 DashboardInfo 字段迁入)供 UI 消费 */
+    pd::PlatformCaps platformCaps;
+    platformCaps.vendor = pd::Vendor::Intel;
+    platformCaps.cpuName = cpuLine;
+    platformCaps.gfxPower = true;        /* PP1 MSR 一直被读取 */
+    platformCaps.platformPower = true;   /* PSYS MSR 一直被读取 */
+    platformCaps.powerLimits = true;     /* MCHBAR MMIO 已映射成功才到这里 */
+    platformCaps.residency = true;
+    platformCaps.smi = true;
+    platformCaps.budgetW = thermal_spec_power;
+    platformCaps.tjMaxC = tjMaxC;
+    platformCaps.baseGHz = baseMHz / 1000.0;
+    platformCaps.logicalProcessors = nLP;
+
     const ULONGLONG monitorStarted = GetTickCount64();
 
     // Main loop
@@ -844,11 +846,6 @@ static int RunMonitor(int argc, char* argv[],
         prev_c2 = c2;       prev_c6 = c6;
         prev_smi = smi;     prev_tsc = tsc;
 
-        /* PL time windows: same layout as the MSR, but this machine
-         * programs PLs through MCHBAR MMIO - read tau from there */
-        std::string tau1 = fmtTau((pl1_raw >> 17) & 0x7F);
-        std::string tau2 = fmtTau((pl2_raw >> 17) & 0x7F);
-
         const char* modeName = "n/a";
         {
             uint32_t mraw = 0;
@@ -856,29 +853,36 @@ static int RunMonitor(int argc, char* argv[],
                 modeName = DecodeMode(mraw);
         }
 
-        pd::PowerSample sample;
+        /* Task 6 将移除的 v1→v2 适配:从上面的 v1 局部量构造 Sample v2
+         * (UI/CSV 已只消费统一模型)。PSYS 为 0 或 tau 编码为 0 时按
+         * v2 语义给 NA;PL2 为 0 沿用 v1 的"未知"处理(刻度走 fallback) */
+        pd::Sample sample;
         sample.timestamp = LocalIsoTimestamp();
-        sample.elapsedSeconds = (GetTickCount64() - monitorStarted) / 1000.0;
-        sample.pkgPower = pkg_power;
-        sample.iaPower = pp0_power;
-        sample.gtPower = pp1_power;
-        sample.sysPower = sys_power;
-        sample.pl1Watt = pl1_watt;
-        sample.pl2Watt = pl2_watt;
-        sample.pl1Window = tau1;
-        sample.pl2Window = tau2;
-        sample.plLocked = plLocked;
-        sample.tempC = tempC;
-        sample.freqGHz = freqGHz;
-        sample.c0Pct = c0pct;
-        sample.c2Pct = c2mid;
-        sample.c6Pct = c6pct;
-        sample.utilPct = utilPct;
+        sample.elapsedS = (GetTickCount64() - monitorStarted) / 1000.0;
+        sample.pkgW = pd::Ok(pkg_power);
+        sample.coresW = pd::Ok(pp0_power);
+        sample.gfxW = pd::Ok(pp1_power);
+        sample.platformW = sys_power > 0.0 ? pd::Ok(sys_power) : pd::NA();
+        sample.powerLimit.sustainedW = pd::Ok(pl1_watt);
+        sample.powerLimit.burstW =
+            pl2_watt > 0.0 ? pd::Ok(pl2_watt) : pd::NA();
+        {
+            const uint64_t rawTau = (pl1_raw >> 17) & 0x7F;
+            sample.powerLimit.sustainedWindowS =
+                rawTau ? pd::Ok(rawTau * time_unit) : pd::NA();
+        }
+        sample.powerLimit.locked = plLocked;
+        sample.tempC = tempC >= 0 ? pd::Ok(tempC) : pd::NA();
+        sample.freqGHz = freqGHz > 0.0 ? pd::Ok(freqGHz) : pd::NA();
+        sample.c0Pct = pd::Ok(c0pct);
+        sample.c2Pct = pd::Ok(c2mid);
+        sample.c6Pct = pd::Ok(c6pct);
+        sample.utilPct = pd::Ok(utilPct);
         sample.smiDelta = smiDelta;
         sample.mode = modeName;
 
         if (csv.is_open()) {
-            csv << pd::CsvRow(sample) << '\n';
+            csv << pd::CsvRow(pd::Vendor::Intel, sample) << '\n';
             csv.flush();
             if (!csv) {
                 std::cerr << "CSV write failed: " << monitorOptions.csvPath
@@ -903,7 +907,7 @@ static int RunMonitor(int argc, char* argv[],
             if (hist.size() > 60)
                 hist.erase(hist.begin(), hist.end() - 60);
             const std::string dashboard =
-                pd::RenderDashboard(dashboardInfo, sample, hist);
+                pd::RenderDashboard(dashboardInfo, platformCaps, sample, hist);
 
             /* flicker-free refresh: rewind to the frame top and overwrite
              * in place. Unchanged lines are only skipped over (cursor-down,
@@ -948,17 +952,24 @@ static int RunMonitor(int argc, char* argv[],
         } else {
             /* no VT console (piped/remote): one compact line per frame */
             std::cout << "f " << std::setw(4) << frame
-                      << " pkg " << std::setw(6) << sample.pkgPower
-                      << " ia " << std::setw(5) << sample.iaPower
-                      << " gt " << std::setw(5) << sample.gtPower
-                      << " sys " << std::setw(5) << sample.sysPower
-                      << " PL1 " << std::setw(5) << sample.pl1Watt
-                      << " PL2 " << std::setw(5) << sample.pl2Watt;
-            if (sample.tempC >= 0) std::cout << " T " << sample.tempC << "C";
-            if (sample.freqGHz > 0) std::cout << " f " << sample.freqGHz << "GHz";
-            std::cout << " C0 " << (int)(sample.c0Pct + 0.5) << "%"
-                      << " C6+ " << (int)(sample.c6Pct + 0.5) << "%"
-                      << " SMI+" << sample.smiDelta << std::endl;
+                      << " pkg " << std::setw(6) << sample.pkgW.value
+                      << " ia " << std::setw(5) << sample.coresW.value
+                      << " gt " << std::setw(5) << sample.gfxW.value
+                      << " sys " << std::setw(5)
+                      << (sample.platformW.valid ? sample.platformW.value : 0.0)
+                      << " PL1 " << std::setw(5)
+                      << sample.powerLimit.sustainedW.value
+                      << " PL2 " << std::setw(5)
+                      << (sample.powerLimit.burstW.valid
+                              ? sample.powerLimit.burstW.value
+                              : 0.0);
+            if (sample.tempC.valid)
+                std::cout << " T " << sample.tempC.value << "C";
+            if (sample.freqGHz.valid)
+                std::cout << " f " << sample.freqGHz.value << "GHz";
+            std::cout << " C0 " << (int)(sample.c0Pct.value + 0.5) << "%"
+                      << " C6+ " << (int)(sample.c6Pct.value + 0.5) << "%"
+                      << " SMI+" << sample.smiDelta.value_or(0) << std::endl;
         }
         frame++;
     }

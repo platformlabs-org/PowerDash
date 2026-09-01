@@ -23,6 +23,9 @@
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="PowerDashModel.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
     <ClInclude Include="PowerDashUi.h">
       <Filter>头文件</Filter>
     </ClInclude>

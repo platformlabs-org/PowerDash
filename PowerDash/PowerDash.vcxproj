@@ -143,6 +143,7 @@
     <ClCompile Include="PowerDashUi.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="PowerDashModel.h" />
     <ClInclude Include="PowerDashUi.h" />
   </ItemGroup>
   <ItemGroup>

@@ -1,5 +1,7 @@
+#include "../PowerDash/PowerDashModel.h"
 #include "../PowerDash/PowerDashUi.h"
 
+#include <cmath>
 #include <cstdlib>
 #include <iostream>
 #include <string>
@@ -259,6 +261,32 @@ void TestAnsiColorsPreserveDashboardGeometry() {
                             "ANSI colors must not change dashboard geometry");
 }
 
+void TestModelDecompositionIdentities() {
+    pd::Sample s;                                   // Intel: SYS = PKG + REST
+    s.pkgW = pd::Ok(18.5); s.coresW = pd::Ok(12.0);
+    s.gfxW = pd::Ok(0.5); s.platformW = pd::Ok(25.0);
+    pd::PlatformCaps intel; intel.vendor = pd::Vendor::Intel;
+    intel.platformPower = true;
+    pd::Decomposition d = pd::Decompose(s, intel);
+    Expect(d.title == "SYSTEM POWER", "intel decomposition title");
+    Expect(d.totalW.valid && d.totalW.value == 25.0, "intel total = platform");
+    Expect(d.mainW.valid && d.mainW.value == 18.5, "intel main = pkg");
+    Expect(d.restW.valid && std::abs(d.restW.value - 6.5) < 0.01,
+           "intel rest = platform - pkg");
+    Expect(d.identity == "PKG + REST = SYSTEM", "intel identity");
+
+    pd::Sample a;                                   // AMD: PKG = CORES + GFX + REST
+    a.pkgW = pd::Ok(7.08); a.coresW = pd::Ok(1.50);
+    a.gfxW = pd::Ok(0.01);
+    pd::PlatformCaps amd; amd.vendor = pd::Vendor::Amd;
+    pd::Decomposition e = pd::Decompose(a, amd);
+    Expect(e.title == "PACKAGE POWER", "amd decomposition title");
+    Expect(e.totalW.valid && e.totalW.value == 7.08, "amd total = pkg");
+    Expect(e.restW.valid && std::abs(e.restW.value - 5.57) < 0.01,
+           "amd rest = pkg - cores - gfx");
+    Expect(e.identity == "CORES + GFX + REST = PKG", "amd identity");
+}
+
 } // namespace
 
 int main() {
@@ -269,6 +297,7 @@ int main() {
     TestWideDashboardBalancesAtAGlanceAndDiagnosticInformation();
     TestNarrowDashboardStacksGroupsWithoutDroppingMetrics();
     TestAnsiColorsPreserveDashboardGeometry();
+    TestModelDecompositionIdentities();
 
     if (failures != 0) {
         std::cerr << failures << " test assertion(s) failed\n";

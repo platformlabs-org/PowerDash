@@ -1,0 +1,7 @@
+// embedded kernel driver (built by PowerDashSYS project, Release x64 output)
+// NOTE: path is fixed to the Release output; Debug builds embed the last
+//       built Release driver (acceptable for this tool, which always loads
+//       the test-signed Release binary anyway).
+#define IDR_SYS_DRIVER 101
+
+IDR_SYS_DRIVER RCDATA "..\\x64\\Release\\PowerDashSYS\\PowerDash.sys"

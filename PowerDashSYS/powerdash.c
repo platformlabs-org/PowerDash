@@ -7,30 +7,175 @@
 /*!     \file powerdash.c
 */
 
-#define NT_DEVICE_NAME L"\\Driver\\POWERDASH"
+#define NT_DEVICE_NAME L"\\Device\\PowerDash"   /* devices belong in \Device\;
+                                                   a name under \Driver\ would collide
+                                                   (case-insensitively) with the driver
+                                                   object of the INF service 'powerdash' */
 #define DOS_DEVICE_NAME L"\\DosDevices\\POWERDASH"
 
 struct DeviceExtension
 {
     HANDLE devMemHandle;
     HANDLE counterSetHandle;
+    PDEVICE_OBJECT lowerDO;     /* FDO only: device below us in the PnP stack */
 };
 
+/*
+ *  Fn+Q notification injection (Lenovo EnergyDrv / AcpiVpc.sys).
+ *
+ *  Synthesizes the kernel-side effect of the Fn+Q hotkey so that
+ *  FnHotkeyUtility pops the power-mode OSD for the *current* DYTC mode:
+ *      - devext + 0xEC + i*4  : per-channel notify counters
+ *      - devext + 0x58 + i*8  : named events (EnergyDrvEvent1/2/3)
+ *      - driver image + 0x7C80: mode2 registered consumer array,
+ *        ctx size 0xB0, PKEVENT at ctx+0x10, count at image+0xD484
+ *  Offsets verified against AcpiVpc.sys 15.11.30.11
+ *  (SHA256 F589BB88137DED8BFEA1F2F741B51EF7F0BD27A4BE51A48978B91D0C29E936FE).
+ */
+#define VPC_MUTEX_OFF        0xA0
+#define VPC_COUNTER_OFF(i)   (0xEC + (i) * 4)
+#define VPC_NAMEDEV_OFF(i)   (0x58 + (i) * 8)
+#define VPC_MODE2_ARRAY_RVA  0x7C80
+#define VPC_MODE2_COUNT_RVA  0xD484
+#define VPC_CTX_SIZE         0xB0
+#define VPC_CTX_EVENT_OFF    0x10
+#define VPC_MAX_CONSUMERS    0x3F
+
+NTSYSAPI
+NTSTATUS
+NTAPI
+ObReferenceObjectByName(
+    __in PUNICODE_STRING ObjectName,
+    __in ULONG Attributes,
+    __in_opt PACCESS_STATE AccessState,
+    __in_opt ACCESS_MASK DesiredAccess,
+    __in_opt POBJECT_TYPE ObjectType,
+    __in KPROCESSOR_MODE AccessMode,
+    __inout_opt PVOID ParseContext,
+    __out PVOID *Object);
+
+extern POBJECT_TYPE IoDeviceObjectType;
+
+static VOID FnQInject(PULONG64 pResult)
+{
+    UNICODE_STRING name;
+    PDEVICE_OBJECT vpcDevObj = NULL;
+    PFILE_OBJECT fileObj = NULL;
+    PUCHAR devext, drvBase;
+    PKEVENT event;
+    PVOID mutex;
+    LONG cnt, i;
+    ULONG signaled = 0;
+    NTSTATUS status;
+
+    *pResult = 0;
+
+    RtlInitUnicodeString(&name, L"\\Device\\EnergyDrv");
+    status = ObReferenceObjectByName(&name, OBJ_CASE_INSENSITIVE, NULL, 0,
+                                     IoDeviceObjectType, KernelMode, NULL,
+                                     (PVOID *)&vpcDevObj);
+    if (!NT_SUCCESS(status))
+    {
+        /* fallback through the DOS symlink */
+        RtlInitUnicodeString(&name, L"\\DosDevices\\EnergyDrv");
+        status = IoGetDeviceObjectPointer(&name, 0, &fileObj, &vpcDevObj);
+        if (!NT_SUCCESS(status))
+        {
+            DbgPrint("PowerDash: FnQInject cannot find EnergyDrv => %08X\n", status);
+            *pResult = 0x80000000ULL | (ULONG64)(0x01000000 | (status & 0xFFFFFF));
+            return;
+        }
+    }
+
+    devext = (PUCHAR)vpcDevObj->DeviceExtension;
+    drvBase = (PUCHAR)vpcDevObj->DriverObject->DriverStart;
+
+    if (!devext || !drvBase || vpcDevObj->DriverObject->DriverSize < VPC_MODE2_COUNT_RVA + 4)
+    {
+        *pResult = 0x80000000ULL | (ULONG64)0x02000000;
+        goto out;
+    }
+
+    /* sanity: registered consumer count must be 0..0x3F */
+    cnt = *(volatile LONG *)(drvBase + VPC_MODE2_COUNT_RVA);
+    if (cnt < 0 || cnt > VPC_MAX_CONSUMERS)
+    {
+        *pResult = 0x80000000ULL | (ULONG64)0x03000000;
+        goto out;
+    }
+
+    mutex = (PVOID)(devext + VPC_MUTEX_OFF);
+    status = KeWaitForSingleObject(mutex, Executive, KernelMode, FALSE, NULL);
+    if (!NT_SUCCESS(status))
+    {
+        *pResult = 0x80000000ULL | (ULONG64)(0x04000000 | (status & 0xFFFFFF));
+        goto out;
+    }
+
+    /* mode2 counter = 1, exactly what a real Fn+Q press leaves behind */
+    InterlockedExchange((PLONG)(devext + VPC_COUNTER_OFF(1)), 1);
+
+    event = *(PKEVENT *)(devext + VPC_NAMEDEV_OFF(1));
+    if (event)
+    {
+        KeSetEvent(event, IO_NO_INCREMENT, FALSE);
+        signaled++;
+    }
+
+    for (i = 0; i < cnt; i++)
+    {
+        event = *(PKEVENT *)(drvBase + VPC_MODE2_ARRAY_RVA +
+                             (ULONG)i * VPC_CTX_SIZE + VPC_CTX_EVENT_OFF);
+        if (event)
+        {
+            KeSetEvent(event, IO_NO_INCREMENT, FALSE);
+            signaled++;
+        }
+    }
+
+    KeReleaseMutex(mutex, FALSE);
+    *pResult = signaled;
+    DbgPrint("PowerDash: FnQInject signaled %u events\n", signaled);
+
+out:
+    if (fileObj)
+        ObDereferenceObject(fileObj);
+    else
+        ObDereferenceObject(vpcDevObj);
+}
+
 DRIVER_INITIALIZE DriverEntry;
+DRIVER_ADD_DEVICE PnpAddDevice;
 
 __drv_dispatchType(IRP_MJ_CREATE)
 __drv_dispatchType(IRP_MJ_CLOSE)
 DRIVER_DISPATCH dummyFunction;
+
+__drv_dispatchType(IRP_MJ_PNP)
+DRIVER_DISPATCH pnpDispatch;
+
+__drv_dispatchType(IRP_MJ_POWER)
+DRIVER_DISPATCH powerDispatch;
+
+__drv_dispatchType(IRP_MJ_SYSTEM_CONTROL)
+DRIVER_DISPATCH wmiDispatch;
 
 __drv_dispatchType(IRP_MJ_DEVICE_CONTROL)
 DRIVER_DISPATCH deviceControl;
 
 DRIVER_UNLOAD MSRUnload;
 
+static BOOLEAN g_weOwnControlDevice = TRUE;   /* FALSE if another instance
+                                                 already owns \Device\PowerDash */
+
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(INIT,DriverEntry)
 #pragma alloc_text(PAGE,MSRUnload)
 #pragma alloc_text(PAGE,dummyFunction)
+#pragma alloc_text(PAGE,pnpDispatch)
+#pragma alloc_text(PAGE,powerDispatch)
+#pragma alloc_text(PAGE,wmiDispatch)
+#pragma alloc_text(PAGE,PnpAddDevice)
 #pragma alloc_text(PAGE,deviceControl)
 #endif
 
@@ -48,11 +193,41 @@ DriverEntry(
     struct DeviceExtension * pExt = NULL;
     UNICODE_STRING devMemPath;
     OBJECT_ATTRIBUTES attr;
+    PFILE_OBJECT existingFileObject = NULL;
+    PDEVICE_OBJECT existingDeviceObject = NULL;
 
     UNREFERENCED_PARAMETER(RegistryPath);
 
     RtlInitUnicodeString(&UnicodeString, NT_DEVICE_NAME);
     RtlInitUnicodeString(&dosDeviceName, DOS_DEVICE_NAME);
+
+    /*
+     *  The control device name is global while this driver can be loaded
+     *  twice (SCM service 'PowerDashSYS' by PowerDash.exe AND the INF
+     *  service 'powerdash' via PnP). If another instance already owns
+     *  \Device\PowerDash, reuse it instead of failing with a name
+     *  collision; we then own neither device nor symlink and must not
+     *  delete them on unload.
+     */
+    status = IoGetDeviceObjectPointer(&UnicodeString, FILE_ALL_ACCESS,
+                                      &existingFileObject, &existingDeviceObject);
+    if (NT_SUCCESS(status))
+    {
+        ObDereferenceObject(existingFileObject);
+        g_weOwnControlDevice = FALSE;
+        DbgPrint("PowerDash: control device already owned by another instance\n");
+
+        DriverObject->DriverUnload = MSRUnload;
+        DriverObject->DriverExtension->AddDevice = PnpAddDevice;
+        DriverObject->MajorFunction[IRP_MJ_CLOSE] = dummyFunction;
+        DriverObject->MajorFunction[IRP_MJ_CREATE] = dummyFunction;
+        DriverObject->MajorFunction[IRP_MJ_PNP] = pnpDispatch;
+        DriverObject->MajorFunction[IRP_MJ_POWER] = powerDispatch;
+        DriverObject->MajorFunction[IRP_MJ_SYSTEM_CONTROL] = wmiDispatch;
+        DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = deviceControl;
+        return STATUS_SUCCESS;
+    }
+    g_weOwnControlDevice = TRUE;
 
 #if 1
     status = IoCreateDeviceSecure(DriverObject,
@@ -80,8 +255,12 @@ DriverEntry(
         return status;
 
     DriverObject->DriverUnload = MSRUnload;
+    DriverObject->DriverExtension->AddDevice = PnpAddDevice;
     DriverObject->MajorFunction[IRP_MJ_CLOSE] = dummyFunction;
     DriverObject->MajorFunction[IRP_MJ_CREATE] = dummyFunction;
+    DriverObject->MajorFunction[IRP_MJ_PNP] = pnpDispatch;
+    DriverObject->MajorFunction[IRP_MJ_POWER] = powerDispatch;
+    DriverObject->MajorFunction[IRP_MJ_SYSTEM_CONTROL] = wmiDispatch;
     DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = deviceControl;
 
     pExt = DriverObject->DeviceObject->DeviceExtension;
@@ -117,12 +296,166 @@ NTSTATUS dummyFunction(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 }
 
 
+/*
+ *  PnP support (INF installable).
+ *
+ *  The driver works in two modes:
+ *    - SCM service mode: DriverEntry creates the named control device
+ *      (\Device\PowerDash + \\.\POWERDASH) directly. Used by PowerDash.exe.
+ *    - PnP mode (INF install via pnputil/devcon): DriverEntry runs first
+ *      (control device already created), then AddDevice is called for the
+ *      Root\PowerDash devnode. We create an unnamed FDO and attach it to
+ *      the PDO; the control device keeps serving the IOCTL interface.
+ */
+NTSTATUS
+PnpAddDevice(
+    __in PDRIVER_OBJECT DriverObject,
+    __in PDEVICE_OBJECT PhysicalDeviceObject
+    )
+{
+    NTSTATUS status;
+    PDEVICE_OBJECT fdo = NULL;
+    struct DeviceExtension * pExt = NULL;
+
+    UNREFERENCED_PARAMETER(DriverObject);
+
+    PAGED_CODE();
+
+    status = IoCreateDeviceSecure(DriverObject,
+        sizeof(struct DeviceExtension),
+        NULL,                       /* unnamed FDO */
+        FILE_DEVICE_UNKNOWN,
+        FILE_DEVICE_SECURE_OPEN,
+        FALSE,
+        &SDDL_DEVOBJ_SYS_ALL_ADM_ALL,
+        NULL,
+        &fdo
+        );
+
+    if (!NT_SUCCESS(status))
+        return status;
+
+    pExt = (struct DeviceExtension *)fdo->DeviceExtension;
+    pExt->devMemHandle = NULL;
+    pExt->counterSetHandle = NULL;
+    pExt->lowerDO = IoAttachDeviceToDeviceStack(fdo, PhysicalDeviceObject);
+
+    if (!pExt->lowerDO)
+    {
+        IoDeleteDevice(fdo);
+        return STATUS_DEVICE_REMOVED;
+    }
+
+    fdo->Flags &= ~DO_DEVICE_INITIALIZING;
+    DbgPrint("PowerDash: AddDevice ok, FDO=%p attached to PDO=%p\n", fdo, PhysicalDeviceObject);
+
+    return STATUS_SUCCESS;
+}
+
+
+NTSTATUS
+pnpDispatch(
+    __in PDEVICE_OBJECT DeviceObject,
+    __inout PIRP Irp
+    )
+{
+    struct DeviceExtension * pExt = (struct DeviceExtension *)DeviceObject->DeviceExtension;
+    PIO_STACK_LOCATION irpStack = IoGetCurrentIrpStackLocation(Irp);
+    NTSTATUS status;
+
+    PAGED_CODE();
+
+    if (!pExt->lowerDO)
+    {
+        /* not one of ours (should not happen) */
+        Irp->IoStatus.Status = STATUS_INVALID_DEVICE_REQUEST;
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+        return STATUS_INVALID_DEVICE_REQUEST;
+    }
+
+    switch (irpStack->MinorFunction)
+    {
+    case IRP_MN_REMOVE_DEVICE:
+        IoSkipCurrentIrpStackLocation(Irp);
+        status = IoCallDriver(pExt->lowerDO, Irp);
+        IoDetachDevice(pExt->lowerDO);
+        IoDeleteDevice(DeviceObject);
+        DbgPrint("PowerDash: RemoveDevice\n");
+        return status;
+
+    default:
+        IoSkipCurrentIrpStackLocation(Irp);
+        return IoCallDriver(pExt->lowerDO, Irp);
+    }
+}
+
+
+/*
+ *  Power / WMI IRPs. Without these dispatchers registered the I/O manager
+ *  fails every IRP_MJ_POWER with STATUS_INVALID_DEVICE_REQUEST, which puts
+ *  the devnode into problem-code-31 right after a successful start.
+ *  FDO: pass down. Control device: complete with success.
+ */
+NTSTATUS
+powerDispatch(
+    __in PDEVICE_OBJECT DeviceObject,
+    __inout PIRP Irp
+    )
+{
+    struct DeviceExtension * pExt = (struct DeviceExtension *)DeviceObject->DeviceExtension;
+
+    PAGED_CODE();
+
+    if (pExt->lowerDO)
+    {
+        PoStartNextPowerIrp(Irp);
+        IoSkipCurrentIrpStackLocation(Irp);
+        return PoCallDriver(pExt->lowerDO, Irp);
+    }
+
+    PoStartNextPowerIrp(Irp);
+    Irp->IoStatus.Status = STATUS_SUCCESS;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return STATUS_SUCCESS;
+}
+
+
+NTSTATUS
+wmiDispatch(
+    __in PDEVICE_OBJECT DeviceObject,
+    __inout PIRP Irp
+    )
+{
+    struct DeviceExtension * pExt = (struct DeviceExtension *)DeviceObject->DeviceExtension;
+
+    PAGED_CODE();
+
+    if (pExt->lowerDO)
+    {
+        IoSkipCurrentIrpStackLocation(Irp);
+        return IoCallDriver(pExt->lowerDO, Irp);
+    }
+
+    Irp->IoStatus.Status = STATUS_SUCCESS;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return STATUS_SUCCESS;
+}
+
+
+
 VOID MSRUnload(PDRIVER_OBJECT DriverObject)
 {
     PDEVICE_OBJECT deviceObject = DriverObject->DeviceObject;
     UNICODE_STRING nameString;
 
     PAGED_CODE();
+
+    if (!g_weOwnControlDevice)
+    {
+        /* another instance owns the control device; our FDOs (if any) are
+           deleted through IRP_MN_REMOVE, nothing else to do here */
+        return;
+    }
 
     RtlInitUnicodeString(&nameString, DOS_DEVICE_NAME);
 
@@ -332,6 +665,11 @@ NTSTATUS deviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
                     break;
                 }
                 Irp->IoStatus.Information = size;                                         // result size
+                break;
+
+            case IO_CTL_FNQ_INJECT:
+                FnQInject(output);          /* count of events, or 0x8ZZSSSS error code */
+                Irp->IoStatus.Information = sizeof(ULONG64);
                 break;
 
             default:

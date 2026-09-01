@@ -22,11 +22,16 @@
     <Inf Include="PowerDash.inf">
       <DeploymentContent Condition="'$(Configuration)|$(Platform)'=='Release|x64'">true</DeploymentContent>
       <FileType>Document</FileType>
+      <!-- pin INF DriverVer version (default 1.0.0.0, override with /p:PD_VERSION=x.y.z.w);
+           without this the WDK stamps a time-derived HH.MM.SS.mmm on every build -->
+      <SpecifyDriverVerDirectiveVersion>true</SpecifyDriverVerDirectiveVersion>
+      <TimeStamp>$(PD_VERSION)</TimeStamp>
     </Inf>
     <None Include="ReadMe.txt" />
   </ItemGroup>
   <PropertyGroup Label="Globals">
     <ProjectGuid>{856577E4-B1F5-48EB-8D42-1B1FFD78B4BE}</ProjectGuid>
+    <PD_VERSION Condition="'$(PD_VERSION)'==''">1.0.0.0</PD_VERSION>
     <TemplateGuid>{497e31cb-056b-4f31-abb8-447fd55ee5a5}</TemplateGuid>
     <TargetFrameworkVersion>v4.5</TargetFrameworkVersion>
     <MinimumVisualStudioVersion>12.0</MinimumVisualStudioVersion>
@@ -34,9 +39,13 @@
     <Platform Condition="'$(Platform)' == ''">x64</Platform>
     <RootNamespace>PowerDashSYS</RootNamespace>
     <WindowsTargetPlatformVersion>$(LatestTargetPlatformVersion)</WindowsTargetPlatformVersion>
+    <SpectreMitigation>false</SpectreMitigation>
+    <SignMode>Off</SignMode>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <SpectreMitigation>false</SpectreMitigation>
+    <SignMode>Off</SignMode>
     <TargetVersion>Windows10</TargetVersion>
     <UseDebugLibraries>true</UseDebugLibraries>
     <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
@@ -45,6 +54,8 @@
     <DriverTargetPlatform>Universal</DriverTargetPlatform>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <SpectreMitigation>false</SpectreMitigation>
+    <SignMode>Off</SignMode>
     <TargetVersion>Windows10</TargetVersion>
     <UseDebugLibraries>false</UseDebugLibraries>
     <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
@@ -53,6 +64,8 @@
     <DriverTargetPlatform>Universal</DriverTargetPlatform>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'" Label="Configuration">
+    <SpectreMitigation>false</SpectreMitigation>
+    <SignMode>Off</SignMode>
     <TargetVersion>Windows10</TargetVersion>
     <UseDebugLibraries>true</UseDebugLibraries>
     <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
@@ -61,6 +74,8 @@
     <DriverTargetPlatform>Universal</DriverTargetPlatform>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|ARM64'" Label="Configuration">
+    <SpectreMitigation>false</SpectreMitigation>
+    <SignMode>Off</SignMode>
     <TargetVersion>Windows10</TargetVersion>
     <UseDebugLibraries>false</UseDebugLibraries>
     <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>

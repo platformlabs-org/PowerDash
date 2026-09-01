@@ -77,6 +77,39 @@ AMD 平台（CPUID `AuthenticAMD` 自动识别，Ryzen 移动 APU）当前支持
 | `PowerDashSYS` | 内核驱动：MSR 读写、PCI 配置读写、物理内存映射、PMU 计数器分配、**Fn+Q 通知注入**（`IO_CTL_FNQ_INJECT`） |
 | `PowerDash` | 用户态 CLI |
 
+## 架构（分层）
+
+用户态按「入口 → Probe → Sampler → UI/CSV」四层拆分，平台差异收敛在 Probe 层，
+下游只消费统一模型：
+
+```
+PowerDash.cpp          CLI 入口：参数解析、命令分发、驱动装卸生命周期（瘦身后仅剩编排）
+  └─ CreateProbe()（PowerDashProbe.h：IPlatformProbe 接口 + PlatformCaps 能力位）
+       ├─ PowerDashIntel.cpp    Intel：RAPL 能量 MSR、MCHBAR PL1/PL2、TjMax、
+       │                        C2/C6 驻留、SMI（自旧 RunPowerMonitor 迁出）
+       └─ PowerDashAmd.cpp      AMD：能量计数器差分、SMN 温度、APERF/MPERF 频率；
+                                能力位诚实降级（无 PSYS/GT/驻留/SMI/限值）
+            │ 每秒 readSample(Sample&)
+            ▼
+       PowerDashSampler.*        采样引擎：节拍、能量差分、回绕、历史窗口（平台无关）
+            │ 统一 Sample v2 模型（PowerDashModel.h：Reading 自带 valid 语义，
+            │ 根除「0 是零值还是不支持」歧义；Decompose 供功率条分解）
+            ├─ PowerDashUi.*     面板渲染：RenderDashboard 只读统一模型，
+            │                   按 PlatformCaps 自动降级（见「AMD 支持」）
+            └─ CSV v2 宽表      CsvRow(Vendor, Sample)：union 列 + platform 列，
+                                无效读数写空单元格
+PowerDashSYS            内核驱动新增 IO_CTL_SMN_READ：AMD SMN 地址/数据寄存器
+                        （NB 0x60/0x64）单次 IOCTL 原子互斥读取，取代用户态
+                        PCICFG 写→读配对，内核侧序列化防并发交错
+```
+
+设计全文（模块边界、类型体系、表述映射表、CSV v2 schema、降级矩阵、测试策略）：
+[docs/superpowers/specs/2026-09-01-powerdash-architecture-design.md](docs/superpowers/specs/2026-09-01-powerdash-architecture-design.md)。
+
+**后续任务**：AMD 限值读取（PPT/TDC/EDC，SMU PMTable 解码）待一台 **AMD Lenovo
+实机**到位后实施——需实测核对 family 偏移表（PMTable 布局随 CPU 世代变化），
+这是当前 AMD 面板 POWER LIMITS 区隐藏、CSV 限值列为空的唯一缺口。
+
 ## 构建
 
 VS2022 + WDK 10（本机已含）。命令行：`build.cmd`（Release x64，驱动自动测试签名）。

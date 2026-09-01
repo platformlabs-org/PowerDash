@@ -47,9 +47,7 @@ std::unique_ptr<IPlatformProbe> CreateIntelProbe(DriverIo& io,
 std::unique_ptr<IPlatformProbe> CreateAmdProbe(DriverIo& io,
                                                const PlatformInfo& info);
 
-// vendor 分流工厂(Task 6 接线入口):按 PlatformInfo.vendor 选探针;
-// AMD 探针落地前的窗口期返回 nullptr,由调用方报 "Unsupported platform"
-// 退出(Task 8 把 nullptr 臂替换为 CreateAmdProbe 分流)。
+// vendor 分流工厂:按 PlatformInfo.vendor 选探针(Intel/AMD 双臂已落地)。
 std::unique_ptr<IPlatformProbe> CreateProbe(DriverIo& io,
                                             const PlatformInfo& info);
 

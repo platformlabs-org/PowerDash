@@ -141,6 +141,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="PowerDash.cpp" />
+    <ClCompile Include="PowerDashAmd.cpp" />
     <ClCompile Include="PowerDashIntel.cpp" />
     <ClCompile Include="PowerDashProbe.cpp" />
     <ClCompile Include="PowerDashSampler.cpp" />

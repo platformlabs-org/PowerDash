@@ -87,11 +87,12 @@ void WindowsDriverIo::UnmapPhys(void* virt) {
                     nullptr, 0, &returned, nullptr);
 }
 
-// CreateIntelProbe 落地于 PowerDashIntel.cpp;CreateAmdProbe 由 Task 8 落地。
+// CreateIntelProbe 落地于 PowerDashIntel.cpp,CreateAmdProbe 落地于
+// PowerDashAmd.cpp —— 按 vendor 分流,双臂均已落地。
 std::unique_ptr<IPlatformProbe> CreateProbe(DriverIo& io,
                                             const PlatformInfo& i) {
-    if (i.vendor == Vendor::Amd) return nullptr;   /* AmdProbe 落地于后续任务 */
-    return CreateIntelProbe(io, i);
+    return i.vendor == Vendor::Amd ? CreateAmdProbe(io, i)
+                                   : CreateIntelProbe(io, i);
 }
 
 } // namespace pd

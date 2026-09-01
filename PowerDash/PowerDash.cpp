@@ -807,6 +807,8 @@ static void Usage() {
         "leaves an open cmd prompt in this exe's folder for further commands.\n"
         "Panel: responsive 96/72-column dashboard with a PL1/PL2 gauge,\n"
         "balanced diagnostics, color status and 60-second statistics.\n"
+        "On AMD platforms the monitor currently supports a monitoring\n"
+        "subset (power, temperature, frequency, utilization, mode).\n"
         "\n"
         "Kernel driver (PowerDashSYS) is loaded on demand for power/-setpl/\n"
         "mode next; 'mode status' only needs Lenovo AcpiVpc.sys\n"

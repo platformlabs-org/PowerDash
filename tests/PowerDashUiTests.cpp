@@ -147,6 +147,13 @@ pd::PlatformCaps IntelCapsFixture() {
     return caps;
 }
 
+pd::PlatformCaps AmdCapsFixture() {
+    pd::PlatformCaps c; c.vendor = pd::Vendor::Amd;
+    c.cpuName = "AMD Ryzen 7 8845H  [Hawk Point]";
+    c.logicalProcessors = 16; c.baseGHz = 3.8; c.tjMaxC = 95;
+    return c;                       // 其余能力位 false
+}
+
 pd::Sample SampleFixture() {
     pd::Sample sample;
     sample.elapsedS = 92;
@@ -272,6 +279,27 @@ void TestNarrowDashboardStacksGroupsWithoutDroppingMetrics() {
     Expect(!groupsShareLine, "72-column layout should stack diagnostic groups");
     ExpectEveryLineHasWidth(frame, 72,
                             "every narrow dashboard row should be exactly 72 columns");
+}
+
+void TestAmdDashboardHidesAbsentSections() {
+    pd::Sample s;                                   // pkg 28 = cores 22 + gfx NA + rest 6
+    s.pkgW = pd::Ok(28.0); s.coresW = pd::Ok(22.0); s.gfxW = pd::NA();
+    s.tempC = pd::Ok(61); s.freqGHz = pd::Ok(4.1); s.utilPct = pd::Ok(12);
+    s.mode = "Intelligent (APM)";
+    const std::string frame = pd::RenderDashboard(DashboardFixture(96),
+                                                  AmdCapsFixture(), s, {28.0});
+    Expect(frame.find("PACKAGE POWER · 28.00 W") != std::string::npos,
+           "amd top section title carries pkg total");
+    Expect(frame.find("CORES + GFX + REST = PKG") != std::string::npos,
+           "amd legend identity");
+    Expect(frame.find("of SYS") == std::string::npos, "no SYS denominator on amd");
+    Expect(frame.find("CPU RESIDENCY") == std::string::npos, "residency hidden");
+    Expect(frame.find("SMI") == std::string::npos, "smi hidden");
+    Expect(frame.find(" GT ") == std::string::npos, "gfx domain hidden");
+    Expect(frame.find(" UTIL ") != std::string::npos &&
+           frame.find(" TEMP ") != std::string::npos &&
+           frame.find(" FREQ ") != std::string::npos, "platform-neutral rows stay");
+    ExpectEveryLineHasWidth(frame, 96, "amd dashboard geometry holds");
 }
 
 void TestAnsiColorsPreserveDashboardGeometry() {
@@ -572,6 +600,7 @@ int main() {
     TestLogoIsCenteredAndColorDoesNotChangeItsWidth();
     TestWideDashboardBalancesAtAGlanceAndDiagnosticInformation();
     TestNarrowDashboardStacksGroupsWithoutDroppingMetrics();
+    TestAmdDashboardHidesAbsentSections();
     TestAnsiColorsPreserveDashboardGeometry();
     TestModelDecompositionIdentities();
     TestDriverIoFixtureRouting();

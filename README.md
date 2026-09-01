@@ -46,6 +46,22 @@ v1 → v2 迁移表：
 | (无) | limit_sustained_window_s, tdc_a, edc_a, platform, limit_locked |
 | c0/c2/c6_pct, smi_delta, mode, temp_c, freq_ghz, util_pct | 同名保留 |
 
+## AMD 支持（实验性）
+
+AMD 平台（CPUID `AuthenticAMD` 自动识别，Ryzen 移动 APU）当前支持**监控子集**：
+
+- **支持**：封装/核功率（能量计数器差分）、温度（Tctl）、频率（APERF/MPERF）、
+  CPU 利用率、电源模式（mode）。
+- **面板自动降级**：顶区标题为 PACKAGE POWER（无 PSYS 总功率），POWER DOMAINS
+  只显示 IA 行（无 GT/SYSTEM），温度无 `/ TjMax` 后缀（TjMax 未知时），
+  CPU RESIDENCY / SMI / POWER LIMITS 区整体隐藏，功率条刻度回退 60 W spec
+  默认值（`spec` 标注）。
+- **不支持**：PSYS/GT 功率、C0/C2/C6 驻留率、SMI 计数、功耗墙读取与设定
+  （`-setpl` 走 Intel MCHBAR 路径，AMD 上不可用）——SMU PMTable 限值解码列为
+  实测机到位后的后续任务。
+- **CSV v2 语义**：平台不支持的列持续写**空单元格**（不是 0），`platform` 列
+  为 `amd`；下游以空单元格区分"平台不支持"与"读数为零"。
+
 ## 单 exe 无感驱动装卸
 
 `PowerDash.exe` 内嵌 `PowerDash.sys`（资源 `IDR_SYS_DRIVER`）。需要内核功能的

@@ -744,6 +744,28 @@ void TestIntelProbeWideTable() {
     }
 }
 
+// 核号 = 顺序核索引(HWiNFO 口径,fix round 1):repLP≠index 拓扑验证。
+// Intel 侧同 AMD 统一约定(amd.CSV 证据:Zen5 0/Zen5c 1/… 顺序核索引);
+// LNL 1T/核下 index==repLP,故宽表主测试字符串不变,此处显式钉住口径。
+void TestIntelProbeCoreIndexNaming() {
+    FixtureDriverIo io;
+    io.msrPerCore[{0, 0x606}] = 16ull << 8;
+    io.msrPerCore[{5, 0x198}] = 40ull << 8;   // repLP 5 可读 -> 核 1 有时钟列
+    pd::PlatformInfo info;
+    info.vendor = pd::Vendor::Intel;
+    info.logicalProcessors = 8;
+    info.cores = { {0, {0, 1}, 0}, {5, {5}, 1} };   // repLP 0/5,索引 0/1
+    auto probe = pd::CreateIntelProbe(io, info);
+    pd::SensorTable* t = probe->sensors();
+    int i = -1;
+    Expect((i = t->Find("clock.1")) >= 0 &&
+               t->Column(i).name == "E-core 1 Clock [MHz]",
+           "intel core name uses sequential index (repLP 5 -> index 1)");
+    Expect((i = t->Find("cores.c0.lp5")) >= 0 &&
+               t->Column(i).name == "E-core 1 T0 C0 Residency [%]",
+           "intel per-thread column also uses sequential index");
+}
+
 // ---- Task 8: AmdProbe(保底监控集)----
 // v3 Task 4:能量 fixture 改用静态 (core,msr) 表两拍法 —— ctor 基线一圈读
 // repLP 集合,测试在帧前 bump 表值模拟每个核自己的 32 位计数器前进;若实
@@ -1141,7 +1163,9 @@ void TestAmdProbeWideTable() {
     pd::PlatformInfo info;
     info.vendor = pd::Vendor::Amd;
     // nLP 取真机值:NtUsageSource 按条目数精确校验返回长度,只有与系统
-    // LP 数一致时 usage 才能出值(暖机后断言依赖它)。
+    // LP 数一致时 usage 才能出值(暖机后断言依赖它)。隐含假设:测试机
+    // ≥4 LP(cores 只覆盖 LP0-3;更小的机器会触发 repLP 越界防线回退
+    // 全 LP 拓扑,断言即失效 —— 本 CI 机 16 LP)。
     info.logicalProcessors = std::thread::hardware_concurrency();
     info.family = 0x1A;
     info.cores = { {0, {0, 1}, 0}, {2, {2, 3}, 1} };   // Zen5(2T) + Zen5c(2T)
@@ -1152,26 +1176,26 @@ void TestAmdProbeWideTable() {
     Expect(std::abs(probe->caps().baseGHz - 3.5) < 1e-9,
            "caps base = P0 fid 700 x 5 / 1000");
 
-    // 列名 = amd.CSV 原文(核名 family 0x1A:Zen5/Zen5c + repLP 编号;
+    // 列名 = amd.CSV 原文(核名 family 0x1A:Zen5/Zen5c + 顺序核索引;
     // 功率列 = 纯 "Core %u Power" 核序号 —— amd.CSV 即如此)
     int i = -1;
     Expect((i = t->Find("vid.0")) >= 0 &&
                t->Column(i).name == "Zen5 Core 0 VID [V]",
            "core 0 uses Zen5 naming");
     Expect((i = t->Find("clock.1")) >= 0 &&
-               t->Column(i).name == "Zen5c Core 2 Clock [MHz]",
-           "core 1 uses Zen5c naming numbered by repLP");
+               t->Column(i).name == "Zen5c Core 1 Clock [MHz]",
+           "core 1 uses Zen5c naming by sequential index (repLP 2 -> 1)");
     Expect((i = t->Find("eff.1.1")) >= 0 &&
-               t->Column(i).name == "Zen5c Core 2 T1 Effective Clock [MHz]",
+               t->Column(i).name == "Zen5c Core 1 T1 Effective Clock [MHz]",
            "per-thread effective clock uses HWiNFO T0/T1 naming");
     Expect((i = t->Find("usage.0.1")) >= 0 &&
                t->Column(i).name == "Zen5 Core 0 T1 Usage [%]",
            "per-thread usage column name");
     Expect((i = t->Find("util.1.0")) >= 0 &&
-               t->Column(i).name == "Zen5c Core 2 T0 Utility [%]",
+               t->Column(i).name == "Zen5c Core 1 T0 Utility [%]",
            "per-thread utility column name");
     Expect((i = t->Find("cores.c0.1")) >= 0 &&
-               t->Column(i).name == "Zen5c Core 2 C0 Residency [%]",
+               t->Column(i).name == "Zen5c Core 1 C0 Residency [%]",
            "per-core C0 residency column name");
     Expect((i = t->Find("temp.tctl")) >= 0 &&
                t->Column(i).name == "CPU (Tctl/Tdie) [°C]",
@@ -1385,6 +1409,71 @@ void TestAmdProbeWideTable() {
     Expect(!tb.Lookup("epp.avg").valid, "epp NA when no core is readable");
 }
 
+// tsc 校准失败(tscHz=0)守卫:eff 列 NA(ΔAPERF 差分存在也不得发
+// 0 MHz 假值 —— 与 bus/比率同口径);C0/utility/节流调整(ΔA/ΔM 比值)
+// 与 COFVID 时钟均不依赖 tsc,照常出。CalibrateTscHz 真失败依赖 QPC/
+// 计时器,单测环境不可构造,经 TscCalibrationOverride 注入(生产恒
+// nullptr)。
+void TestAmdProbeTscUnavailableEffNa() {
+    FixtureDriverIo io;
+    io.msrPerCore[{0, 0xC0010299}] = 16ull << 8;
+    io.msrPerCore[{0, 0xC001029B}] = 0;
+    io.msrPerCore[{0, 0xC0010293}] = (80ull << 14) | 0x2BCull;
+    io.msrPerCore[{0, 0xC0010064}] = 0x2BC;              // P0 在,但 tsc=0
+    io.msrPerCore[{0, 0xC00000E8}] = 0;
+    io.msrPerCore[{0, 0xC00000E7}] = 0;
+    pd::TscCalibrationOverride = [] { return 0.0; };
+    pd::PlatformInfo info;
+    info.vendor = pd::Vendor::Amd;
+    info.logicalProcessors = 16;
+    info.family = 0x1A;
+    auto probe = pd::CreateAmdProbe(io, info);
+    pd::TscCalibrationOverride = nullptr;                // 用毕即还原
+    pd::SensorTable* t = probe->sensors();
+    io.msrPerCore[{0, 0xC001029B}] = 65536;              // 1.0 W 保帧
+    io.msrPerCore[{0, 0xC00000E8}] = 1000;               // ΔA/ΔM 差分存在
+    io.msrPerCore[{0, 0xC00000E7}] = 2000;
+    pd::Sample s;
+    Expect(probe->readSample(s), "tsc-unavailable sample reads");
+    Expect(!t->Lookup("eff.0.0").valid && !t->Lookup("eff.all").valid,
+           "amd eff columns NA without TSC calibration");
+    Expect(!t->Lookup("clock.bus").valid && !t->Lookup("ratio.0").valid,
+           "amd bus/ratio NA without TSC calibration (same guard)");
+    Expect(t->Lookup("cores.c0.0").valid,
+           "amd C0 does not depend on TSC calibration");
+    Expect(t->Lookup("clock.0").valid &&
+               std::abs(t->Lookup("clock.0").value - 1750.0) < 1e-9,
+           "amd COFVID clock survives without TSC (3500 x dA/dM throttle)");
+}
+
+void TestIntelProbeTscUnavailableEffNa() {
+    FixtureDriverIo io;
+    io.msrPerCore[{0, 0x606}] = 16ull << 8;
+    io.msrPerCore[{0, 0x611}] = 0;                       // pkg 保帧
+    for (unsigned lp = 0; lp < 2; ++lp) {
+        io.msrPerCore[{lp, 0xE8}] = 0;
+        io.msrPerCore[{lp, 0xE7}] = 0;
+    }
+    pd::TscCalibrationOverride = [] { return 0.0; };
+    pd::PlatformInfo info;
+    info.vendor = pd::Vendor::Intel;
+    info.logicalProcessors = 2;
+    auto probe = pd::CreateIntelProbe(io, info);
+    pd::TscCalibrationOverride = nullptr;                // 用毕即还原
+    pd::SensorTable* t = probe->sensors();
+    io.msrPerCore[{0, 0x611}] = 65536;                   // 1.0 W 保帧
+    io.msrPerCore[{0, 0xE8}] = 1000;                     // ΔA/ΔM 差分存在
+    io.msrPerCore[{0, 0xE7}] = 2000;
+    pd::Sample s;
+    Expect(probe->readSample(s), "intel tsc-unavailable sample reads");
+    Expect(!t->Lookup("eff.0").valid && !t->Lookup("eff.all").valid,
+           "intel eff columns NA without TSC calibration");
+    Expect(!t->Lookup("clock.bus").valid,
+           "intel bus NA without TSC calibration (same guard)");
+    Expect(t->Lookup("cores.c0.lp0").valid,
+           "intel C0 does not depend on TSC calibration");
+}
+
 void TestSamplerDrivesSinkAndFillsPlatformIndependentFields() {
     FakeProbe p;
     pd::Sample a; a.pkgW = pd::Ok(5.0); a.mode = "n/a";
@@ -1595,6 +1684,7 @@ int main() {
     TestIntelProbeReplay();
     TestIntelProbeEnergyWraparound();
     TestIntelProbeWideTable();
+    TestIntelProbeCoreIndexNaming();
     TestAmdProbeReplay();
     TestAmdProbeEnergyWraparound();
     TestAmdProbeDegradesAndFuses();
@@ -1603,6 +1693,8 @@ int main() {
     TestAmdProbeTempRangeOffset();
     TestAmdProbePstateBaseClock();
     TestAmdProbeWideTable();
+    TestAmdProbeTscUnavailableEffNa();
+    TestIntelProbeTscUnavailableEffNa();
     TestSamplerDrivesSinkAndFillsPlatformIndependentFields();
     TestSamplerExitsAfterFiveConsecutiveFailures();
     TestUsageMonitorDiff();

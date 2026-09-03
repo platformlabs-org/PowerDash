@@ -108,6 +108,9 @@ std::unique_ptr<IPlatformProbe> CreateProbe(DriverIo& io,
                                    : CreateIntelProbe(io, i);
 }
 
+// 测试注入点(见 PowerDashProbe.h 注释):生产恒 nullptr。
+double (*TscCalibrationOverride)() = nullptr;
+
 double CalibrateTscHz() {
     // QPC 与 __rdtsc 成对采样,间隔 ~150 ms:
     // hz = Δtsc * qpcFreq / Δqpc。结果非正/非有限 -> 0(调用方退避)。

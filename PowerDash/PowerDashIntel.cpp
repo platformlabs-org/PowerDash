@@ -89,15 +89,18 @@ constexpr struct { uint32_t msr; const char* key; const char* name; }
     };
 
 // HWiNFO 核名:effClass 0→"P-core n"、1→"E-core n"、≥2→"E-core (LP) n",
-// 编号 = repLP(spec §1.1 GetLogicalProcessorInformationEx 命名约定)
-std::string CoreName(const CoreInfo& c) {
+// 编号 = 顺序核索引(cores_ 向量 0 基位置;spec §1.1 命名约定)。与 AMD
+// 探针统一口径,依据实测 amd.CSV(Krackan Point 8C/16T)核列为
+// "Zen5 Core 0/Zen5c Core 1/…" 顺序物理核索引 —— repLP 取号在 SMT 机上
+// 会跳号(0/2/4/…),与 HWiNFO 不符;LNL 1T/核下 index==repLP,数值不变。
+std::string CoreName(const CoreInfo& c, size_t idx) {
     char buf[48];
     if (c.effClass == 0)
-        snprintf(buf, sizeof(buf), "P-core %u", c.repLP);
+        snprintf(buf, sizeof(buf), "P-core %u", (unsigned)idx);
     else if (c.effClass == 1)
-        snprintf(buf, sizeof(buf), "E-core %u", c.repLP);
+        snprintf(buf, sizeof(buf), "E-core %u", (unsigned)idx);
     else
-        snprintf(buf, sizeof(buf), "E-core (LP) %u", c.repLP);
+        snprintf(buf, sizeof(buf), "E-core (LP) %u", (unsigned)idx);
     return buf;
 }
 
@@ -135,7 +138,8 @@ public:
             caps_.tjMaxC = static_cast<int>((tj >> 16) & 0xFF);
         /* busClock = 实测 TSC ÷ 0xCE[15:8](LHM 同式);校准/寄存器任一
          * 失败 -> 0,时钟/比率列恒 NA(不做名义 100 MHz 兜底,准确度红线)。 */
-        tscHz_ = CalibrateTscHz();
+        tscHz_ = TscCalibrationOverride ? TscCalibrationOverride()
+                                        : CalibrateTscHz();
         if (tscHz_ > 0.0) {
             uint64_t ce = 0;
             if (io_.ReadMsr(0, MSR_PLATFORM_INFO, ce)) {
@@ -330,11 +334,16 @@ public:
                 L.prevAperf = a;
                 L.prevMperf = m;
                 if (dtsc <= 0.0) continue;
-                const double eff = dA * tscHz_ / dtsc / 1e6;   // ΔAPERF/Δt = 平均有效频率(tscHz 为 Hz,列单位 MHz)
+                /* eff 依赖 tscHz:校准失败(tscHz_=0)时 eff 列保持 NA
+                 * (帧首已置无效)—— 不把 0×ΔA 的假 0 MHz 当有效值,
+                 * 与 bus/比率守卫同口径;C0(÷ΔTSC)不依赖 tsc,照常出。 */
                 const double c0 = dM / dtsc * 100.0;
                 table_.Set(L.idxC0, Ok(c0));
-                effCore[i].Add(eff);
-                effAll.Add(eff);
+                if (tscHz_ > 0.0) {
+                    const double eff = dA * tscHz_ / dtsc / 1e6;   // ΔAPERF/Δt = 平均有效频率(tscHz 为 Hz,列单位 MHz)
+                    effCore[i].Add(eff);
+                    effAll.Add(eff);
+                }
                 c0Avg.Add(c0);
                 if (lu.ok && lp < lu.busyPct.size()) {
                     usageCore[i].Add(lu.busyPct[lp]);
@@ -612,8 +621,8 @@ private:
     int AddCol(const char* key, const std::string& name, SensorFmt fmt) {
         return (int)table_.Add(key, name, fmt);
     }
-    std::string SuffixName(const CoreInfo& c, const char* suffix) {
-        return CoreName(c) + suffix;
+    std::string SuffixName(size_t idx, const char* suffix) {
+        return CoreName(cores_[idx], idx) + suffix;
     }
 
     // 构建列集:组序对齐 intel.CSV(电压→时钟→有效→Usage→Utility→Ratio→
@@ -631,7 +640,7 @@ private:
             if (coreSt_[i].perfOk) {
                 snprintf(key, sizeof(key), "vid.%zu", i);
                 coreSt_[i].idxVid =
-                    AddCol(key, SuffixName(cores_[i], " Voltage [V]"),
+                    AddCol(key, SuffixName(i," Voltage [V]"),
                            SensorFmt::F3);
             }
 
@@ -641,7 +650,7 @@ private:
             if (coreSt_[i].perfOk) {
                 snprintf(key, sizeof(key), "clock.%zu", i);
                 coreSt_[i].idxClock =
-                    AddCol(key, SuffixName(cores_[i], " Clock [MHz]"),
+                    AddCol(key, SuffixName(i," Clock [MHz]"),
                            SensorFmt::F1);
             }
         idxClockBus_ = AddCol("clock.bus", "Bus Clock [MHz]", SensorFmt::F1);
@@ -652,7 +661,7 @@ private:
         for (size_t i = 0; i < n; ++i) {
             snprintf(key, sizeof(key), "eff.%zu", i);
             coreSt_[i].idxEff =
-                AddCol(key, SuffixName(cores_[i], " Effective Clock [MHz]"),
+                AddCol(key, SuffixName(i," Effective Clock [MHz]"),
                        SensorFmt::F1);
         }
         idxAllEff_ = AddCol("eff.all", "Average Effective Clock [MHz]",
@@ -663,7 +672,7 @@ private:
         for (size_t i = 0; i < n; ++i) {
             snprintf(key, sizeof(key), "usage.%zu", i);
             coreSt_[i].idxUsage =
-                AddCol(key, SuffixName(cores_[i], " Usage [%]"), SensorFmt::PCT1);
+                AddCol(key, SuffixName(i," Usage [%]"), SensorFmt::PCT1);
         }
         idxUsageMax_ = AddCol("usage.max", "Max CPU/Thread Usage [%]",
                               SensorFmt::PCT1);
@@ -677,7 +686,7 @@ private:
         for (size_t i = 0; i < n; ++i) {
             snprintf(key, sizeof(key), "util.%zu", i);
             coreSt_[i].idxUtil =
-                AddCol(key, SuffixName(cores_[i], " Utility [%]"), SensorFmt::PCT1);
+                AddCol(key, SuffixName(i," Utility [%]"), SensorFmt::PCT1);
         }
         idxTotalUtil_ = AddCol("util.total", "Total CPU Utility [%]",
                                SensorFmt::PCT1);
@@ -689,7 +698,7 @@ private:
             if (coreSt_[i].perfOk) {
                 snprintf(key, sizeof(key), "ratio.%zu", i);
                 coreSt_[i].idxRatio =
-                    AddCol(key, SuffixName(cores_[i], " Ratio [x]"),
+                    AddCol(key, SuffixName(i," Ratio [x]"),
                            SensorFmt::RATIO2);
             }
 
@@ -700,7 +709,7 @@ private:
             if (coreSt_[i].thermOk) {
                 snprintf(key, sizeof(key), "temp.%zu", i);
                 coreSt_[i].idxTemp =
-                    AddCol(key, SuffixName(cores_[i], " [°C]"), SensorFmt::F1);
+                    AddCol(key, SuffixName(i," [°C]"), SensorFmt::F1);
             }
         idxAvgDist_ = AddCol("tjmax.avg", "Core Distance to TjMAX (avg) [°C]",
                              SensorFmt::F1);
@@ -708,7 +717,7 @@ private:
             if (coreSt_[i].thermOk) {
                 snprintf(key, sizeof(key), "tjmax.%zu", i);
                 coreSt_[i].idxDist =
-                    AddCol(key, SuffixName(cores_[i], " Distance to TjMAX [°C]"),
+                    AddCol(key, SuffixName(i," Distance to TjMAX [°C]"),
                            SensorFmt::F1);
             }
         idxTempPkg_ = AddCol("temp.pkg", "CPU Package [°C]", SensorFmt::F1);
@@ -737,7 +746,7 @@ private:
                 if (coreSt_[i].thermOk) {
                     snprintf(key, sizeof(key), "thr.%zu.%s", i, thrPerKeys[k]);
                     coreSt_[i].idxThr[k] =
-                        AddCol(key, SuffixName(cores_[i], thrPerNames[k]),
+                        AddCol(key, SuffixName(i,thrPerNames[k]),
                                SensorFmt::YESNO);
                 }
         }
@@ -788,7 +797,7 @@ private:
                 char tail[32];
                 snprintf(tail, sizeof(tail), " T%zu C0 Residency [%%]", t);
                 lp_[lp].idxC0 =
-                    AddCol(key, SuffixName(cores_[i], tail), SensorFmt::PCT1);
+                    AddCol(key, SuffixName(i,tail), SensorFmt::PCT1);
             }
         struct CoreC { uint32_t msr; const char* key; const char* name;
                        const char* avgKey; const char* avgName;
@@ -814,7 +823,7 @@ private:
                 if (coreSt_[i].*(cc.ok)) {
                     snprintf(key, sizeof(key), "cores.%s.%zu", cc.key, i);
                     coreSt_[i].*(cc.idx) =
-                        AddCol(key, SuffixName(cores_[i], cc.name),
+                        AddCol(key, SuffixName(i,cc.name),
                                SensorFmt::PCT1);
                 }
         }

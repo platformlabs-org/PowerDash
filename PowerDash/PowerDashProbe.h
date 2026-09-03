@@ -62,4 +62,10 @@ std::unique_ptr<IPlatformProbe> CreateProbe(DriverIo& io,
 // hz = Δtsc * qpcFreq / Δqpc。失败返回 0(调用方退避)。
 double CalibrateTscHz();
 
+// TSC 校准测试注入点:探针 ctor 优先调用此指针(非空时),生产恒
+// nullptr -> 走 CalibrateTscHz()。单测注入恒 0 覆盖"校准失败 ->
+// eff 列 NA"守卫分支(真失败依赖 QPC/计时器,单测环境不可构造;
+// 全局函数指针,仅单线程测试使用)。
+extern double (*TscCalibrationOverride)();
+
 } // namespace pd

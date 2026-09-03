@@ -55,7 +55,9 @@ bool WindowsDriverIo::WritePciCfg(unsigned bus, unsigned dev, unsigned fn,
 }
 
 bool WindowsDriverIo::ReadSmn(uint32_t smnAddr, uint32_t& out) {
-    // 驱动内 FAST_MUTEX 原子完成 0x60 写地址 / 0x64 读数据序列;
+    // 驱动内 FAST_MUTEX 原子完成 0xB8 写地址 / 0xBC 读数据序列(B0:D0:F0;
+    // 0x60/0x64 数据口写被 Krackan 实测拒绝,0xB8/0xBC 为 ryzenAdj Windows 全读写
+    // 路径 lib/win32/osdep_win32.cpp NB_PCI_REG_ADDR_ADDR/DATA,两窗独立闩锁不可混用);
     // 结构体同缓冲进出(MethodBuffered),驱动 Information = sizeof(SMN_Request) 回写 value。
     SMN_Request req{};
     req.address = smnAddr;
@@ -69,7 +71,7 @@ bool WindowsDriverIo::ReadSmn(uint32_t smnAddr, uint32_t& out) {
 }
 
 bool WindowsDriverIo::WriteSmn(uint32_t smnAddr, uint32_t value) {
-    // 同 ReadSmn 形态但无回读:驱动侧在互斥内写 0x60(地址)/0x64(数据),
+    // 同 ReadSmn 形态但无回读:驱动侧在互斥内写 0xB8(地址)/0xBC(数据),
     // Information = 0,故输出缓冲传空。
     SMN_Request req{};
     req.address = smnAddr;

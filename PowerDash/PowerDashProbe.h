@@ -8,7 +8,7 @@ class SensorTable;   // v3 宽表(PowerDashSensors.h);接口层只出指针,不�
 
 // 驱动 IO 原语抽象:生产环境包装 DeviceIoControl(WindowsDriverIo),
 // 测试中用 FixtureDriverIo 注入应答。SMN 访问必须走 ReadSmn/WriteSmn
-// (驱动内原子互斥的 IO_CTL_SMN_READ/WRITE),禁止用户态拆写 0x60/0x64。
+// (驱动内原子互斥的 IO_CTL_SMN_READ/WRITE),禁止用户态拆写 0xB8/0xBC。
 class DriverIo {
 public:
     virtual ~DriverIo() = default;

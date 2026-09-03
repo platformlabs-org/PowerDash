@@ -2,7 +2,7 @@
 // PowerDashPmTable.h —— SMU PMTable 客户端(v3 Task 6)。
 // ryzenAdj nb_smu_ops.c/api.c 协议(PSMU 默认邮箱,Krackan Point 实证):
 // 邮箱寄存器在 SMN 空间,经驱动 IO_CTL_SMN_READ/WRITE 原子访问(禁止
-// 用户态拆写 0x60/0x64);表内存在 SMU 指示的物理地址,经 IO_CTL_MMAP
+// 用户态拆写 0xB8/0xBC);表内存在 SMU 指示的物理地址,经 IO_CTL_MMAP
 // 映射后按 float 偏移读取。握手任一步失败 -> TryCreate 返 nullptr
 // (诚实降级,探针不建列、Sample 恒 NA)。实现见 PowerDashPmTable.cpp。
 #include "PowerDashProbe.h"

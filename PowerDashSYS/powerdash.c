@@ -1,4 +1,4 @@
-#include "powerdash.h"
+﻿#include "powerdash.h"
 #include "ntdef.h"
 #include <wdm.h>
 #include <wdmsec.h>
@@ -17,8 +17,12 @@ struct DeviceExtension
 {
     HANDLE devMemHandle;
     HANDLE counterSetHandle;
-    FAST_MUTEX smnMutex;       /* serializes the SMN 0x60-write / 0x64-read
-                                  pair in IO_CTL_SMN_READ (AMD northbridge) */
+    FAST_MUTEX smnMutex;       /* serializes the SMN 0xB8-addr / 0xBC-data window
+                                  pair in IO_CTL_SMN_READ/WRITE (AMD northbridge
+                                  B0:D0:F0). 0x60/0x64 数据口写被 Krackan 实测拒绝,
+                                  0xB8/0xBC 为 ryzenAdj Windows 全读写路径
+                                  (lib/win32/osdep_win32.cpp NB_PCI_REG_ADDR_ADDR/DATA);
+                                  两窗独立闩锁不可混用 */
     PDEVICE_OBJECT lowerDO;     /* FDO only: device below us in the PnP stack */
 };
 
@@ -687,16 +691,17 @@ NTSTATUS deviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
                 __try
                 {
                     smnAddr = req->address;
-                    /* 1) write the SMN address window 0x60; nested if/else instead
+                    /* 1) write the SMN address window 0xB8; nested if/else instead
                        of __leave so control always reaches the mutex release below */
                     if (HalSetBusDataByOffset(PCIConfiguration, 0, slot.u.AsULONG,
-                                              &smnAddr, 0x60, 4) != 4)
+                                              &smnAddr, 0xB8, 4) != 4)
                     {
                         status = STATUS_DEVICE_NOT_READY;
                     }
-                    /* 2) read the SMN data window 0x64 */
+                    /* 2) read the SMN data window 0xBC (same window as 0xB8 above;
+                       the 0x60/0x64 window has a separate address latch) */
                     else if (HalGetBusDataByOffset(PCIConfiguration, 0, slot.u.AsULONG,
-                                                   &smnData, 0x64, 4) != 4)
+                                                   &smnData, 0xBC, 4) != 4)
                     {
                         status = STATUS_DEVICE_NOT_READY;
                     }
@@ -733,13 +738,16 @@ NTSTATUS deviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
                 {
                     smnAddr = req->address;
                     smnData = req->value;
+                    /* same 0xB8/0xBC window as IO_CTL_SMN_READ: the two SMN
+                       windows have separate address latches and the 0x64 data
+                       port rejects writes on Krackan */
                     if (HalSetBusDataByOffset(PCIConfiguration, 0, slot.u.AsULONG,
-                                              &smnAddr, 0x60, 4) != 4)
+                                              &smnAddr, 0xB8, 4) != 4)
                     {
                         status = STATUS_DEVICE_NOT_READY;
                     }
                     else if (HalSetBusDataByOffset(PCIConfiguration, 0, slot.u.AsULONG,
-                                                   &smnData, 0x64, 4) != 4)
+                                                   &smnData, 0xBC, 4) != 4)
                     {
                         status = STATUS_DEVICE_NOT_READY;
                     }

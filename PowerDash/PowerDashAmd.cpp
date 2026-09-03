@@ -18,9 +18,12 @@
 //              SMT 去重/逐核独立回绕/陈旧核恢复语义原样保留)
 //   Usage      NtQuerySystemInformation 差分(真源首 2 帧暖期 NA);
 //   Utility    busy×(ΔA/ΔM 钳 [0,4]) 钳 0-100(微软频率加权语义)
-// PMTable(STAPM/TDC/限值)在 Task 6 接入 —— powerLimit/currentLimit
-// 的 Sample 字段本期恒 NA。
+// PMTable(Task 6 接入,PowerDashPmTable.h):SMU PSMU 邮箱握手成功且
+// 版本 == Krackan 0x00650005 时追加 PM 列组(STAPM/TDC/SoC 电流实际 +
+// 限值%),Sample.powerLimit/currentLimit 自 PMTable 偏移派生;握手失败/
+// 版本未知 -> 无 PM 列、相关 Sample 字段恒 NA(诚实降级)。
 #include "PowerDashProbe.h"
+#include "PowerDashPmTable.h"
 #include "PowerDashSensors.h"
 #include "PowerDashUsage.h"
 #include <cmath>
@@ -170,6 +173,18 @@ public:
             std::make_unique<NtUsageSource>(nLP_));
         BuildColumns();    // HWiNFO 命名列集(键表见 task-5-brief Interfaces)
         ReadBaseline();    // pkg + 每核能量基线 + 逐线程 RO A/M + TSC 锚点
+        /* PMTable(Task 6):SMU PSMU 邮箱握手 + 首刷新(TryCreate 内完成)。
+         * 失败 -> nullptr 诚实降级(无 PM 列、Sample 恒 NA、powerLimits
+         * caps 不置);版本 != Krackan 0x00650005 -> 偏移不可信,同样不
+         * 建列,仅留 pmVersionMismatch_ 记号(Task 10 实机核对后扩展)。 */
+        pm_ = SmuPmTable::TryCreate(io_);
+        if (pm_ && pm_->version() == KpPm::kVersion) {
+            pmKnown_ = true;
+            BuildPmColumns();          // 追加在主列组之后(amd.CSV 序)
+            caps_.powerLimits = true;  // UI POWER LIMITS 区(Intel MapPlWindow 同口径)
+        } else if (pm_) {
+            pmVersionMismatch_ = true;
+        }
     }
 
     const PlatformCaps& caps() const override { return caps_; }
@@ -378,6 +393,35 @@ public:
             }
         }
 
+        /* (f2) PMTable —— transfer(0x65)成功后按 Krackan 已知偏移回填;
+         * 刷新失败/偏移越界(At 返 NaN)-> 本帧 PM 列全 NA(帧首
+         * SetInvalid 已兜底,列不清、帧不废 —— PM 域与功率熔断无关,
+         * 下一帧恢复即回值)。% = 实际/限值×100,限值 NaN 或 ≤0 -> NA
+         * (不猜,准确度红线)。 */
+        const bool pmOk = pmKnown_ && pm_->Refresh();
+        if (pmOk) {
+            const auto pmSet = [&](int idx, uint32_t off) {
+                if (idx < 0) return;
+                const float v = pm_->At(off);
+                if (!std::isnan(v)) table_.Set((unsigned)idx, Ok(v));
+            };
+            const auto pmPct = [&](int idx, uint32_t valOff, uint32_t limOff) {
+                if (idx < 0) return;
+                const float v = pm_->At(valOff), l = pm_->At(limOff);
+                if (!std::isnan(v) && !std::isnan(l) && l > 0.0f)
+                    table_.Set((unsigned)idx,
+                               Ok((double)v / (double)l * 100.0));
+            };
+            pmSet(idxPmStapm_, KpPm::StapmValue);   // "APU STAPM [W]"
+            pmSet(idxPmTdc_, KpPm::TdcValue);       // "CPU TDC [A]"
+            pmSet(idxPmSoc_, KpPm::SocCurValue);    // "SoC Current (SVI3 TFN) [A]"
+            pmPct(idxPctTdc_, KpPm::TdcValue, KpPm::TdcLimit);
+            pmPct(idxPctFast_, KpPm::FastValue, KpPm::FastLimit);
+            pmPct(idxPctSlow_, KpPm::SlowValue, KpPm::SlowLimit);
+            pmPct(idxPctStapm_, KpPm::StapmValue, KpPm::StapmLimit);
+            pmPct(idxPctThermal_, KpPm::TctlValue, KpPm::TctlLimit);
+        }
+
         /* (g) Sample 派生 —— 全部经表 Lookup(键缺失/无效 -> NA,UI 按
          * 既有 caps 逻辑降级,渲染层零改动)。coresW 是"和"而
          * power.core.avg 是"均值"(语义不同):从每核功率列求和派生。 */
@@ -394,16 +438,17 @@ public:
         const Reading clockAvgR = table_.Lookup("clock.avg");
         s.freqGHz = clockAvgR.valid ? Ok(clockAvgR.value / 1000.0) : NA();
         s.utilPct = table_.Lookup("usage.total");
-        /* (h) 本平台不提供/Task 6 接入的域 —— 恒 NA/false(诚实降级,
-         * 不猜)。gfx(无 PP1 等价域)/platform(无 PSYS)/PL(PPT 未读,
-         * PMTable Task 6)/TDC-EDC(同)/包级驻留/SMI。 */
+        /* (h) 本平台不提供/未接入的域 —— 恒 NA/false(诚实降级,
+         * 不猜)。gfx(无 PP1 等价域)/platform(无 PSYS)/tau 窗口
+         * (KpPm::StapmTimeS 偏移在,本期不建列)/TDC-EDC(核心 EDC
+         * 偏移未知)/包级驻留/SMI。PMTable 域在 (f2) 已刷新。 */
         s.gfxW = NA();
         s.platformW = NA();
-        s.powerLimit.sustainedW = NA();
-        s.powerLimit.burstW = NA();
+        s.powerLimit.sustainedW = pmOk ? PmAt(KpPm::StapmLimit) : NA();
+        s.powerLimit.burstW = pmOk ? PmAt(KpPm::FastLimit) : NA();
         s.powerLimit.sustainedWindowS = NA();
         s.powerLimit.locked = false;
-        s.currentLimit.tdcA = NA();
+        s.currentLimit.tdcA = pmOk ? PmAt(KpPm::TdcValue) : NA();
         s.currentLimit.edcA = NA();
         s.c0Pct = NA(); s.c2Pct = NA(); s.c6Pct = NA();
         s.smiDelta = std::nullopt;
@@ -430,11 +475,12 @@ private:
     };
 
     // vendor/cpuName/logicalProcessors/baseGHz 来自 PlatformInfo;
-    // 保底能力位:gfx(无 PP1 等价域)/platform(无 PSYS)/powerLimits
-    // (PPT 待 PMTable,Task 6)/residency(Sample c0/c2/c6 恒 NA,宽表
-    // cores.c0.* 列独立存在,不受 caps 位影响)/smi 均不支持;
-    // budgetW=0(UI 走 spec fallback),tjMaxC=0(AMD Tctl 偏移未知,UI 隐藏
-    // TjMax);baseGHz 由 ctor 从 P-state P0 解码覆盖(AMD 权威来源)。
+    // 保底能力位:gfx(无 PP1 等价域)/platform(无 PSYS)/residency
+    // (Sample c0/c2/c6 恒 NA,宽表 cores.c0.* 列独立存在,不受 caps 位
+    // 影响)/smi 均不支持;powerLimits 由 ctor 在 PMTable 握手成功且
+    // 版本匹配时置位(Task 6,Intel MapPlWindow 同口径);budgetW=0(UI
+    // 走 spec fallback),tjMaxC=0(AMD Tctl 偏移未知,UI 隐藏 TjMax);
+    // baseGHz 由 ctor 从 P-state P0 解码覆盖(AMD 权威来源)。
     static PlatformCaps BuildCaps(const PlatformInfo& info) {
         PlatformCaps c;
         c.vendor = info.vendor;
@@ -614,6 +660,34 @@ private:
                          SensorFmt::PCT1);
     }
 
+    // PM 列组(Task 6):追加在全部主列组之后,组内序 STAPM 实际 ->
+    // TDC 实际 -> SoC 电流实际 -> 限值%(TDC/PPT FAST/PPT SLOW/STAPM/
+    // Thermal)。列名照 amd.CSV 原文;HWiNFO 无原始 STAPM/PPT 限值 W 列
+    // —— 限值只以 % 列出现(value/limit×100),STAPM 限值 W 值仅入
+    // Sample.powerLimit。SoC 电流列待 Task 10 实机与 HWiNFO 对应性核对,
+    // 不符则删(spec §4.2 注)。版本门控在 ctor(pmKnown_)。
+    void BuildPmColumns() {
+        idxPmStapm_ = AddCol("pm.stapm.value", "APU STAPM [W]", SensorFmt::F3);
+        idxPmTdc_ = AddCol("pm.tdc.value", "CPU TDC [A]", SensorFmt::F3);
+        idxPmSoc_ = AddCol("pm.soccur.value", "SoC Current (SVI3 TFN) [A]",
+                           SensorFmt::F3);
+        idxPctTdc_ = AddCol("pct.tdc", "CPU TDC Limit [%]", SensorFmt::PCT1);
+        idxPctFast_ = AddCol("pct.pptfast", "CPU PPT FAST Limit [%]",
+                             SensorFmt::PCT1);
+        idxPctSlow_ = AddCol("pct.pptslow", "CPU PPT SLOW Limit [%]",
+                             SensorFmt::PCT1);
+        idxPctStapm_ = AddCol("pct.stapm", "APU STAPM Limit [%]",
+                              SensorFmt::PCT1);
+        idxPctThermal_ = AddCol("pct.thermal", "Thermal Limit [%]",
+                                SensorFmt::PCT1);
+    }
+
+    // PMTable 偏移 -> Reading(NaN -> NA);仅 (f2) pmOk 帧调用。
+    Reading PmAt(uint32_t off) const {
+        const float v = pm_->At(off);
+        return std::isnan(v) ? NA() : Ok(v);
+    }
+
     // 全部 prev 计数器(读取失败保持 0,与既有实现一致)+ TSC 锚点;
     // 逐核 0xC001029A 与逐线程 RO APERF/MPERF 基线与采样同路径
     // (能量每核一个代表 LP,A/M 每线程各一份)。
@@ -652,6 +726,12 @@ private:
     std::unique_ptr<UsageMonitor> usage_;
     std::vector<CoreState> coreSt_;
     std::vector<LpState> lp_;
+    // PMTable 客户端(Task 6):null = SMU 握手失败(诚实降级);
+    // pmKnown_ = 版本 == KpPm::kVersion(偏移可信,PM 列已建);
+    // pmVersionMismatch_ = 有 SMU 但版本未知(仅记号,不建列)。
+    std::unique_ptr<SmuPmTable> pm_;
+    bool pmKnown_ = false;
+    bool pmVersionMismatch_ = false;
     // 既有差分基线(pkg + 每核能量 + TSC;每核 stale 标记)
     uint64_t prevPkg_ = 0, prevTsc_ = 0;
     std::vector<uint64_t> prevCoreE_;      // 每核 0xC001029A 基线
@@ -665,6 +745,10 @@ private:
     int idxTempTctl_ = -1;
     int idxPowerPkg_ = -1, idxPowerCoreAvg_ = -1;
     int idxEpp_ = -1;
+    // PM 列索引(Task 6;-1 = 无 PMTable,整组缺席)
+    int idxPmStapm_ = -1, idxPmTdc_ = -1, idxPmSoc_ = -1;
+    int idxPctTdc_ = -1, idxPctFast_ = -1, idxPctSlow_ = -1;
+    int idxPctStapm_ = -1, idxPctThermal_ = -1;
 };
 
 std::unique_ptr<IPlatformProbe> CreateAmdProbe(DriverIo& io,

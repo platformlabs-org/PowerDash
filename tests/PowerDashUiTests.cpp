@@ -1,5 +1,6 @@
 #include "../PowerDash/PowerDashModel.h"
 #include "../PowerDash/PowerDashProbe.h"
+#include "../PowerDash/PowerDashPmTable.h"
 #include "../PowerDash/PowerDashSampler.h"
 #include "../PowerDash/PowerDashSensors.h"
 #include "../PowerDash/PowerDashUi.h"
@@ -379,6 +380,9 @@ public:
     std::map<uint32_t, uint32_t> smn;                              // smn addr -> value
     std::map<uint32_t, uint32_t> smnWrites;                        // addr -> 最后写入值
     std::function<uint32_t(uint32_t addr)> smnReadHook;            // 动态 SMN(邮箱轮询)
+    // Task 6:可选写钩子,在 smnWrites 记录**之前**调用(SMU 邮箱脚本需
+    // 观察 msg/arg 写入以驱动状态机);记录语义不变(仍存最后写入值)。
+    std::function<void(uint32_t addr, uint32_t value)> smnWriteHook;
     std::vector<uint8_t> physMem;                                  // 假物理内存
     uint64_t mapPhysBase = 0;
     // 可选:按 (core, msr) 脚本化读取失败(单核单次注入用)。真实硬件的
@@ -400,7 +404,10 @@ public:
         if (it == smn.end()) return false;
         out = it->second; return true;
     }
-    bool WriteSmn(uint32_t a, uint32_t v) override { smnWrites[a] = v; return true; }
+    bool WriteSmn(uint32_t a, uint32_t v) override {
+        if (smnWriteHook) smnWriteHook(a, v);   // 先钩子后记录(测试契约)
+        smnWrites[a] = v; return true;
+    }
     bool MapPhys(uint64_t phys, size_t len, void*& virt) override {
         if (physMem.size() < len) return false;
         mapPhysBase = phys; virt = physMem.data(); return true;  // 页内偏移 0(测试构造保证)
@@ -443,6 +450,17 @@ void TestDriverIoFixtureRouting() {
     uint32_t s = 0;
     Expect(io.ReadSmn(0x10, s) && s == 0x11, "smnReadHook dynamic answer");
     io.smnReadHook = nullptr;
+    // Task 6 契约:写钩子在 smnWrites 记录之前观察写入(首写地址在钩子
+    // 内应查无记录),记录语义不变(钩子后仍存最后写入值)。
+    uint32_t seenInHook = 0xDEADu;
+    io.smnWriteHook = [&](uint32_t a, uint32_t) {
+        const auto it = io.smnWrites.find(a);
+        seenInHook = it == io.smnWrites.end() ? 0u : it->second;
+    };
+    Expect(io.WriteSmn(0x3B10A88, 0x47) && seenInHook == 0u &&
+               io.smnWrites[0x3B10A88] == 0x47u,
+           "smnWriteHook observes the write before smnWrites records it");
+    io.smnWriteHook = nullptr;
     io.physMem.assign(0x1000, 0);
     void* p = nullptr;
     Expect(io.MapPhys(0xFED10000ull, 0x1000, p) && p == io.physMem.data() &&
@@ -1409,6 +1427,230 @@ void TestAmdProbeWideTable() {
     Expect(!tb.Lookup("epp.avg").valid, "epp NA when no core is readable");
 }
 
+// ---- Task 6: SMU PSMU 邮箱 PMTable(协议单测 + AMD 探针接入)----
+// 邮箱脚本(状态机在 SmuMailboxScript,经 fixture 钩子驱动):
+//   写钩子 —— msg 寄存器(0x3B10a20)写入即"发出消息"(记 lastMsg);
+//             arg0(0x3B10a88)写入被记录(供 0x47 自检回读)。
+//   读钩子 —— response(0x3B10a80):消息发出后 0x1(OK)、未发出 0;
+//             arg0:msg 0x6 -> 版本 0x00650005、msg 0x66 -> 表地址低 32 位
+//             0x1000(arg1 @0x3B10a8C 走默认 0)、否则回显最近 arg0 写入;
+//             0x59800 -> tctlRaw(k10temp 直通,AMD 集成路径共用);其余 0。
+//   rejectTransfer:接下来 N 次 0x65 的 response 给 0x80(前置拒绝),
+//             驱动 Refresh 的 Sleep(10) 重试一次分支。
+struct SmuMailboxScript {
+    uint32_t lastMsg = 0, arg0 = 0, tctlRaw = 0;
+    bool serveTctl = false;
+    unsigned rejectTransfer = 0;
+    bool transferRejected = false;
+};
+
+void InstallSmuMailbox(FixtureDriverIo& io, SmuMailboxScript& st) {
+    io.smnWriteHook = [&st](uint32_t a, uint32_t v) {
+        if (a == 0x3B10A20u) {
+            st.lastMsg = v;
+            if (v == 0x65u) {                        // transfer 前置拒绝脚本
+                if (st.rejectTransfer > 0) {
+                    --st.rejectTransfer;
+                    st.transferRejected = true;
+                } else {
+                    st.transferRejected = false;
+                }
+            }
+        } else if (a == 0x3B10A88u) {
+            st.arg0 = v;
+        }
+    };
+    io.smnReadHook = [&st](uint32_t a) -> uint32_t {
+        if (st.serveTctl && a == 0x59800u) return st.tctlRaw;
+        if (a == 0x3B10A80u) {                       // response
+            if (st.lastMsg == 0x65u && st.transferRejected) return 0x80u;
+            return st.lastMsg ? 0x1u : 0x0u;
+        }
+        if (a == 0x3B10A88u) {                       // arg0
+            if (st.lastMsg == 0x6u) return 0x00650005u;
+            if (st.lastMsg == 0x66u) return 0x1000u;
+            return st.arg0;
+        }
+        return 0u;
+    };
+}
+
+void TestSmuPmTableProtocol() {
+    FixtureDriverIo io;
+    io.physMem.assign(0x2000, 0);   // 假物理内存(表地址 0x1000 起映射)
+    auto putf = [&](uint32_t off, float v) {
+        std::memcpy(io.physMem.data() + off, &v, 4);
+    };
+    putf(0x00, 28.0f); putf(0x04, 15.5f);      // STAPM 限值/实际
+    putf(0x30, 100.0f); putf(0x34, 42.5f);     // TDC 限值/实际
+    putf(0x40, 100.0f); putf(0x44, 55.25f);    // Tctl 限值/实际
+    SmuMailboxScript st;
+    InstallSmuMailbox(io, st);
+    auto pm = pd::SmuPmTable::TryCreate(io);
+    Expect(pm != nullptr, "SMU handshake succeeds");
+    Expect(pm->version() == 0x00650005u, "version from msg 0x6");
+    Expect(pm->addr() == 0x1000ull,
+           "table address from msg 0x66 (arg1<<32|arg0)");
+    Expect(pm->At(0x04) == 15.5f, "float read at offset");
+    Expect(std::isnan(pm->At(0x1000u)), "offset past the window reads NaN");
+    Expect(std::isnan(pm->At(0xFFDu)), "3-byte-tail offset reads NaN");
+    Expect(!std::isnan(pm->At(0xFFCu)), "window-end 4-byte read stays in range");
+    // ctor 首刷新即 transfer:最后发出的消息是 0x65
+    Expect(io.smnWrites[0x3B10A20u] == 0x65u,
+           "last mailbox message is the 0x65 transfer");
+    Expect(pm->Refresh(), "explicit refresh succeeds");
+    st.rejectTransfer = 1;   // 下一次 0x65 -> 0x80 -> Sleep(10) 重试一次成功
+    Expect(pm->Refresh(), "0x80 prereq rejection retries once and succeeds");
+    putf(0x04, 16.5f);       // At 跟随假物理内存演进
+    Expect(pm->Refresh() && pm->At(0x04) == 16.5f,
+           "At follows physMem after refresh");
+}
+
+void TestAmdProbePmTable() {
+    // 单核 AMD + SMU 邮箱脚本:PM 列组追加、Sample 限值域、caps 位、
+    // 失联/握手失败降级(TscCalibrationOverride=0 使 bus/eff 与断言无关)。
+    FixtureDriverIo io;
+    io.msrPerCore[{0, 0xC0010299}] = 16ull << 8;    // energy bits 16
+    io.msrPerCore[{0, 0xC001029B}] = 0;             // pkg 能量基线 0
+    io.physMem.assign(0x2000, 0);
+    auto putf = [&](uint32_t off, float v) {
+        std::memcpy(io.physMem.data() + off, &v, 4);
+    };
+    putf(0x00, 28.0f); putf(0x04, 15.5f);   // STAPM 限值/实际
+    putf(0x08, 50.0f); putf(0x0C, 30.0f);   // FPPT 限值/实际
+    putf(0x10, 40.0f); putf(0x14, 20.0f);   // SPPT 限值/实际
+    putf(0x30, 100.0f); putf(0x34, 42.5f);  // TDC 限值/实际
+    putf(0x3C, 8.25f);                      // SoC 电流实际
+    putf(0x40, 100.0f); putf(0x44, 55.25f); // Tctl 限值/实际
+    SmuMailboxScript st;
+    st.serveTctl = true; st.tctlRaw = 0x510B0000u;  // k10temp -> 32.0 °C
+    InstallSmuMailbox(io, st);
+    pd::TscCalibrationOverride = [] { return 0.0; };
+    pd::PlatformInfo info;
+    info.vendor = pd::Vendor::Amd;
+    info.logicalProcessors = 4;
+    info.family = 0x1A;
+    info.cores = { {0, {0}, 0} };
+    auto probe = pd::CreateAmdProbe(io, info);
+    pd::TscCalibrationOverride = nullptr;           // 用毕即还原
+    pd::SensorTable* t = probe->sensors();
+    Expect(t != nullptr && probe->caps().powerLimits,
+           "powerLimits caps on when PM columns exist");
+
+    // 8 列精确名(amd.CSV 口径;HWiNFO 无原始 STAPM/PPT 限值 W 列)
+    struct { const char* key; const char* name; } cols[] = {
+        {"pm.stapm.value", "APU STAPM [W]"},
+        {"pm.tdc.value", "CPU TDC [A]"},
+        {"pm.soccur.value", "SoC Current (SVI3 TFN) [A]"},
+        {"pct.tdc", "CPU TDC Limit [%]"},
+        {"pct.pptfast", "CPU PPT FAST Limit [%]"},
+        {"pct.pptslow", "CPU PPT SLOW Limit [%]"},
+        {"pct.stapm", "APU STAPM Limit [%]"},
+        {"pct.thermal", "Thermal Limit [%]"},
+    };
+    int prev = -1;
+    for (const auto& c : cols) {
+        const int i = t->Find(c.key);
+        Expect(i >= 0 && t->Column(i).name == c.name, c.name);
+        Expect(i > prev, "pm column group order is append-only monotonic");
+        prev = i;
+    }
+    Expect(t->Find("epp.avg") < t->Find("pm.stapm.value"),
+           "pm columns append after the main groups");
+
+    io.msrPerCore[{0, 0xC001029B}] = 65536;   // 1.0 W 保帧
+    pd::Sample s;
+    Expect(probe->readSample(s), "frame succeeds with PM table");
+    pd::SensorTable& tb = *t;
+    Expect(tb.Lookup("pm.stapm.value").valid &&
+               std::abs(tb.Lookup("pm.stapm.value").value - 15.5) < 1e-6,
+           "pm.stapm.value = STAPM actual");
+    Expect(tb.Lookup("pm.tdc.value").valid &&
+               std::abs(tb.Lookup("pm.tdc.value").value - 42.5) < 1e-6,
+           "CPU TDC [A] = TDC actual");
+    Expect(tb.Lookup("pm.soccur.value").valid &&
+               std::abs(tb.Lookup("pm.soccur.value").value - 8.25) < 1e-6,
+           "SoC current actual");
+    Expect(tb.Lookup("pct.tdc").valid &&
+               std::abs(tb.Lookup("pct.tdc").value - 42.5) < 1e-9,
+           "CPU TDC Limit [%] = 42.5/100*100");
+    Expect(tb.Lookup("pct.thermal").valid &&
+               std::abs(tb.Lookup("pct.thermal").value - 55.25) < 1e-9,
+           "Thermal Limit [%] = 55.25/100*100");
+    Expect(tb.Lookup("pct.stapm").valid &&
+               std::abs(tb.Lookup("pct.stapm").value -
+                        15.5 / 28.0 * 100.0) < 1e-9,
+           "APU STAPM Limit [%] = 15.5/28*100");
+    Expect(tb.Lookup("pct.pptfast").valid &&
+               std::abs(tb.Lookup("pct.pptfast").value - 60.0) < 1e-9,
+           "CPU PPT FAST Limit [%] = 30/50*100");
+    Expect(tb.Lookup("pct.pptslow").valid &&
+               std::abs(tb.Lookup("pct.pptslow").value - 50.0) < 1e-9,
+           "CPU PPT SLOW Limit [%] = 20/40*100");
+    Expect(tb.Lookup("temp.tctl").valid &&
+               std::abs(tb.Lookup("temp.tctl").value - 32.0) < 1e-9,
+           "k10temp SMN read coexists with the mailbox hook");
+    // Sample 派生:PL1<-STAPM 限值、PL2<-FPPT、TDC<-实际电流
+    Expect(s.powerLimit.sustainedW.valid &&
+               std::abs(s.powerLimit.sustainedW.value - 28.0) < 1e-6,
+           "Sample sustainedW = STAPM limit");
+    Expect(s.powerLimit.burstW.valid &&
+               std::abs(s.powerLimit.burstW.value - 50.0) < 1e-6,
+           "Sample burstW = FPPT limit");
+    Expect(s.currentLimit.tdcA.valid &&
+               std::abs(s.currentLimit.tdcA.value - 42.5) < 1e-6,
+           "Sample tdcA = TDC actual");
+    Expect(s.pkgW.valid && std::abs(s.pkgW.value - 1.0) < 1e-6,
+           "RAPL power unaffected by PM integration");
+
+    // 拍 2:限值 0 -> % NA(不猜),值列照常
+    putf(0x00, 0.0f);
+    pd::Sample s2;
+    Expect(probe->readSample(s2), "beat 2 reads");
+    Expect(!tb.Lookup("pct.stapm").valid, "limit<=0 keeps the pct column NA");
+    Expect(tb.Lookup("pm.stapm.value").valid &&
+               std::abs(tb.Lookup("pm.stapm.value").value - 15.5) < 1e-6,
+           "raw stapm value survives a zero limit");
+
+    // 拍 3:SMU 半路失联(读恒 0 -> transfer 轮询超时)-> PM 列全 NA、
+    // 列不清、帧不废(功率熔断与 PM 域无关)、Sample PM 字段 NA
+    io.smnReadHook = [](uint32_t) { return 0u; };
+    pd::Sample s3;
+    Expect(probe->readSample(s3), "frame survives a dead SMU mailbox");
+    Expect(!tb.Lookup("pm.stapm.value").valid && !tb.Lookup("pct.tdc").valid,
+           "dead SMU blanks all PM columns for the frame");
+    Expect(tb.Find("pm.stapm.value") >= 0 && tb.Find("pct.tdc") >= 0,
+           "PM columns persist through the failure");
+    Expect(!s3.powerLimit.sustainedW.valid && !s3.powerLimit.burstW.valid &&
+               !s3.currentLimit.tdcA.valid,
+           "PM-derived Sample fields NA on the failed frame");
+    // 拍 4:恢复 -> PM 列回值(无永久损伤)
+    InstallSmuMailbox(io, st);
+    pd::Sample s4;
+    Expect(probe->readSample(s4) && tb.Lookup("pm.tdc.value").valid &&
+               std::abs(tb.Lookup("pm.tdc.value").value - 42.5) < 1e-6,
+           "PM columns recover after the mailbox comes back");
+
+    // 失败臂:SMN 读恒 0(arg0 自检回读失败)-> TryCreate nullptr ->
+    // 无 PM 列、powerLimits 关、帧仍成立、Sample 字段 NA
+    FixtureDriverIo io2;
+    io2.msrPerCore[{0, 0xC0010299}] = 16ull << 8;
+    io2.msrPerCore[{0, 0xC001029B}] = 0;
+    io2.smnReadHook = [](uint32_t) { return 0u; };
+    auto probe2 = pd::CreateAmdProbe(io2, info);
+    pd::SensorTable* t2 = probe2->sensors();
+    Expect(t2->Find("pm.stapm.value") < 0 && t2->Find("pm.tdc.value") < 0 &&
+               t2->Find("pct.tdc") < 0,
+           "no PM columns when the handshake fails");
+    Expect(!probe2->caps().powerLimits, "powerLimits caps stays off");
+    io2.msrPerCore[{0, 0xC001029B}] = 65536;
+    pd::Sample s5;
+    Expect(probe2->readSample(s5) && s5.pkgW.valid,
+           "frame still succeeds without PM (power fuse unrelated)");
+    Expect(!s5.powerLimit.sustainedW.valid && !s5.currentLimit.tdcA.valid,
+           "PM Sample fields stay NA without the handshake");
+}
+
 // tsc 校准失败(tscHz=0)守卫:eff 列 NA(ΔAPERF 差分存在也不得发
 // 0 MHz 假值 —— 与 bus/比率同口径);C0/utility/节流调整(ΔA/ΔM 比值)
 // 与 COFVID 时钟均不依赖 tsc,照常出。CalibrateTscHz 真失败依赖 QPC/
@@ -1693,6 +1935,8 @@ int main() {
     TestAmdProbeTempRangeOffset();
     TestAmdProbePstateBaseClock();
     TestAmdProbeWideTable();
+    TestSmuPmTableProtocol();
+    TestAmdProbePmTable();
     TestAmdProbeTscUnavailableEffNa();
     TestIntelProbeTscUnavailableEffNa();
     TestSamplerDrivesSinkAndFillsPlatformIndependentFields();

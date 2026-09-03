@@ -143,6 +143,7 @@
     <ClCompile Include="PowerDash.cpp" />
     <ClCompile Include="PowerDashAmd.cpp" />
     <ClCompile Include="PowerDashIntel.cpp" />
+    <ClCompile Include="PowerDashPmTable.cpp" />
     <ClCompile Include="PowerDashProbe.cpp" />
     <ClCompile Include="PowerDashSampler.cpp" />
     <ClCompile Include="PowerDashSensors.cpp" />
@@ -152,6 +153,7 @@
   <ItemGroup>
     <ClInclude Include="PowerDashIoctl.h" />
     <ClInclude Include="PowerDashModel.h" />
+    <ClInclude Include="PowerDashPmTable.h" />
     <ClInclude Include="PowerDashProbe.h" />
     <ClInclude Include="PowerDashSampler.h" />
     <ClInclude Include="PowerDashSensors.h" />

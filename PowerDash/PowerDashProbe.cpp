@@ -2,6 +2,8 @@
 #include "PowerDashIoctl.h"
 #include "../PowerDashSYS/pdstruct.h"   // MSR_Request / PCICFG_Request / MMAP_Request + IO_CTL_PCICFG_WRITE
 #include <windows.h>
+#include <cmath>
+#include <intrin.h>
 
 namespace pd {
 
@@ -104,6 +106,25 @@ std::unique_ptr<IPlatformProbe> CreateProbe(DriverIo& io,
                                             const PlatformInfo& i) {
     return i.vendor == Vendor::Amd ? CreateAmdProbe(io, i)
                                    : CreateIntelProbe(io, i);
+}
+
+double CalibrateTscHz() {
+    // QPC 与 __rdtsc 成对采样,间隔 ~150 ms:
+    // hz = Δtsc * qpcFreq / Δqpc。结果非正/非有限 -> 0(调用方退避)。
+    LARGE_INTEGER freq = {}, q1 = {}, q2 = {};
+    if (!QueryPerformanceFrequency(&freq) || freq.QuadPart <= 0)
+        return 0.0;
+    if (!QueryPerformanceCounter(&q1)) return 0.0;
+    const unsigned long long t1 = __rdtsc();
+    Sleep(150);
+    if (!QueryPerformanceCounter(&q2)) return 0.0;
+    const unsigned long long t2 = __rdtsc();
+    const long long dq = q2.QuadPart - q1.QuadPart;
+    if (dq <= 0) return 0.0;
+    const double hz =
+        (double)(t2 - t1) * (double)freq.QuadPart / (double)dq;
+    if (!(hz > 0.0) || !std::isfinite(hz)) return 0.0;
+    return hz;
 }
 
 } // namespace pd

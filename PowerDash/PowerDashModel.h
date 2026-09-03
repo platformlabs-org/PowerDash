@@ -57,18 +57,25 @@ struct PlatformCaps {
     unsigned logicalProcessors = 0;
 };
 
+struct CoreInfo {                   // 单个物理核拓扑(v3:Ex API 全量)
+    unsigned repLP = 0;             // 代表 LP(mask 最低置位位,MSR 按核读取用)
+    std::vector<unsigned> threads;  // 该核全部 LP(SMT 兄弟,Windows 相邻
+                                    // 编号,如 8C/16T 为 {0,1}{2,3}…,代表集
+                                    // = {0,2,4,6,8,10,12,14} —— "取前 nCores
+                                    // 个 LP"只会读一半核各两遍,代表集必须
+                                    // 来自实际 mask)
+    unsigned effClass = 0;          // EfficiencyClass:0=性能核;1/2=能效核(分级)
+};
+
 struct PlatformInfo {            // CPUID 静态信息,入口层计算后交给工厂
     Vendor vendor = Vendor::Intel;
     std::string cpuName;         // "brand  [codename]"
     unsigned logicalProcessors = 0;
-    unsigned physicalCores = 0;  // GetLogicalProcessorInformation 统计;0=未知
+    unsigned physicalCores = 0;  // cores.size() 填充(Ex API);0=未知
                                  // (AMD 0xC001029A 按物理核计数,SMT 兄弟 LP
                                  //  共享同一计数器,遍历需去重;0 时退回 nLP)
-    std::vector<unsigned> coreLPs;  // 每个物理核一个代表 LP(其 mask 最低
-                                    // 置位位;Windows SMT 兄弟编号相邻,如
-                                    // 8C/16T 为 {0,1}{2,3}…,代表集 =
-                                    // {0,2,4,6,8,10,12,14})。空 = 拓扑未知,
-                                    // 探针退回全 LP 遍历(旧保底行为)。
+    std::vector<CoreInfo> cores; // 每物理核一条(Ex API);空 = 拓扑未知,
+                                 // 探针退回全 LP 遍历(旧保底行为)
     double baseGHz = 0.0;        // CPUID 0x16;0=未知
     unsigned family = 0;         // CPUID family(AMD 探针按世代分 P-state/
                                  // SMN 解码;Intel 不消费)

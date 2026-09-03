@@ -72,12 +72,13 @@ public:
         caps_ = BuildCaps(info);       // vendor/name/nLP/baseGHz + 保底能力位
         // 0xC001029A 按物理核计数:SMT 兄弟 LP 共享同一计数器,遍历全部
         // nLP 会双计(tb16g7 实测:IA 一度读出 PKG 的 167%)。每个物理核
-        // 只读一个代表 LP(入口层从 GetLogicalProcessorInformation 的核
-        // mask 取最低置位位;Windows 同核兄弟编号相邻,8C/16T 代表集 =
-        // {0,2,4,6,8,10,12,14},实测 LP0/LP1 差分速率 877590/868173 raw/s
-        // 1% 内相等,证明确为同一计数器)。coreLPs 空/越界 = 拓扑未知,
-        // 退回全 nLP 遍历(旧行为,保底不残缺)。
-        coreScanLPs_ = info.coreLPs;
+        // 只读一个代表 LP(入口层 v3 起从 GetLogicalProcessorInformationEx
+        // 的核 mask 集齐兄弟、取 repLP;Windows 同核兄弟编号相邻,8C/16T
+        // 代表集 = {0,2,4,6,8,10,12,14},实测 LP0/LP1 差分速率 877590/868173
+        // raw/s 1% 内相等,证明确为同一计数器)。cores 空/repLP 越界 =
+        // 拓扑未知,退回全 nLP 遍历(旧行为,保底不残缺)。
+        for (const auto& c : info.cores)
+            coreScanLPs_.push_back(c.repLP);
         const bool valid = !coreScanLPs_.empty() && std::all_of(
             coreScanLPs_.begin(), coreScanLPs_.end(),
             [n = caps_.logicalProcessors](unsigned lp) { return lp < n; });

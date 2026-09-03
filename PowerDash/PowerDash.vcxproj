@@ -147,6 +147,7 @@
     <ClCompile Include="PowerDashSampler.cpp" />
     <ClCompile Include="PowerDashSensors.cpp" />
     <ClCompile Include="PowerDashUi.cpp" />
+    <ClCompile Include="PowerDashUsage.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="PowerDashIoctl.h" />
@@ -155,6 +156,7 @@
     <ClInclude Include="PowerDashSampler.h" />
     <ClInclude Include="PowerDashSensors.h" />
     <ClInclude Include="PowerDashUi.h" />
+    <ClInclude Include="PowerDashUsage.h" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="PowerDash.rc" />

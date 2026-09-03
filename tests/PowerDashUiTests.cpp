@@ -3,12 +3,15 @@
 #include "../PowerDash/PowerDashSampler.h"
 #include "../PowerDash/PowerDashSensors.h"
 #include "../PowerDash/PowerDashUi.h"
+#include "../PowerDash/PowerDashUsage.h"
 
 #include <cmath>
 #include <cstdlib>
 #include <functional>
+#include <initializer_list>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -391,6 +394,16 @@ public:
     void UnmapPhys(void*) override {}
 };
 
+// Task 3 适配:PlatformInfo::coreLPs(代表 LP 列表)→ cores(CoreInfo)。
+// 旧测试以代表 LP 列表描述拓扑;helper 逐 repLP 合成单线程 CoreInfo
+// (现存探针只消费 repLP;SMT 兄弟表 threads 仅在真机拓扑里由
+// QueryCoreTopologyV2 填充,Task 4/5 重写探针时再按需扩展)。
+void SetCoreReps(pd::PlatformInfo& info, std::initializer_list<unsigned> reps) {
+    info.cores.clear();
+    for (unsigned lp : reps)
+        info.cores.push_back(pd::CoreInfo{lp, {lp}, 0});
+}
+
 class FakeProbe : public pd::IPlatformProbe {   // 脚本化样本序列
 public:
     std::vector<pd::Sample> script; size_t i = 0; int reads = 0;
@@ -503,7 +516,7 @@ void TestAmdProbeReplay() {
     pd::PlatformInfo info; info.vendor = pd::Vendor::Amd;
     info.cpuName = "AMD Ryzen 7 8845H  [Hawk Point]";
     info.logicalProcessors = 16; info.physicalCores = 8;   // 8C/16T
-    info.coreLPs = {0, 2, 4, 6, 8, 10, 12, 14};            // Windows 相邻对
+    SetCoreReps(info, {0, 2, 4, 6, 8, 10, 12, 14});        // Windows 相邻对
     info.baseGHz = 3.8;
     auto probe = pd::CreateAmdProbe(io, info);
     Expect(probe != nullptr, "amd probe constructs");
@@ -551,7 +564,7 @@ void TestAmdProbeEnergyWraparound() {
         io.msr[0xC001029A] = [&coreEnergy] { return coreEnergy(); };
         pd::PlatformInfo info; info.vendor = pd::Vendor::Amd;
         info.logicalProcessors = 4; info.physicalCores = 4;
-        info.coreLPs = {0, 1, 2, 3};
+        SetCoreReps(info, {0, 1, 2, 3});
         info.baseGHz = 3.8;
         auto probe = pd::CreateAmdProbe(io, info);
         pd::Sample s;
@@ -621,7 +634,7 @@ void TestAmdProbeCoreFailureBlanksDomainAndRebaselines() {
     };
     pd::PlatformInfo info; info.vendor = pd::Vendor::Amd;
     info.logicalProcessors = 4; info.physicalCores = 4;
-    info.coreLPs = {0, 1, 2, 3};
+    SetCoreReps(info, {0, 1, 2, 3});
     info.baseGHz = 3.8;
     auto probe = pd::CreateAmdProbe(io, info);
 
@@ -653,7 +666,7 @@ void TestAmdProbeScansPhysicalCoresOnly() {
     // tb16g7 实测缺陷:0xC001029A 按物理核计数,SMT 兄弟 LP 共享同一
     // 计数器;遍历全部 nLP 会双计(实测 IA 167% of PKG)。Windows 枚举
     // 同核兄弟为相邻 LP(8C/16T mask 0x0003/0x000C/…,代表集 =
-    // {0,2,4,6,8,10,12,14}),探针按 coreLPs 每物理核只读一个代表 LP。
+    // {0,2,4,6,8,10,12,14}),探针按 cores 的 repLP 每物理核只读一个代表 LP。
     // fixture 提供 8 个独立计数器,每物理核每帧 +1024 raw -> 合计
     // 8*1024 = 8192 raw = 0.5 W;若实现遍历 16 个 LP,fixture 的调用
     // 路由被拉长一倍,读数翻倍,数值断言立即失败;oddLP 钩子另证
@@ -671,7 +684,7 @@ void TestAmdProbeScansPhysicalCoresOnly() {
     };
     pd::PlatformInfo info; info.vendor = pd::Vendor::Amd;
     info.logicalProcessors = 16; info.physicalCores = 8;  // 8C/16T SMT
-    info.coreLPs = {0, 2, 4, 6, 8, 10, 12, 14};
+    SetCoreReps(info, {0, 2, 4, 6, 8, 10, 12, 14});
     info.baseGHz = 3.8;
     auto probe = pd::CreateAmdProbe(io, info);
     pd::Sample s;
@@ -680,7 +693,7 @@ void TestAmdProbeScansPhysicalCoresOnly() {
            "cores counts each physical core exactly once");
     Expect(!readOddLp, "per-core MSR never addresses an SMT sibling LP");
 
-    // coreLPs 越界(> nLP)-> 整表弃用,退回全 LP 遍历(保底不残缺):
+    // repLP 越界(> nLP)-> 整表弃用,退回全 LP 遍历(保底不残缺):
     // 16 LP fixture 下 cores 域读满 16 个计数器仍成立。
     FixtureDriverIo io2;
     io2.msr[0xC0010299] = [] { return 14ull << 8; };
@@ -690,7 +703,7 @@ void TestAmdProbeScansPhysicalCoresOnly() {
     io2.msr[0xC001029A] = [&coreEnergy2] { return coreEnergy2(); };
     pd::PlatformInfo info2; info2.vendor = pd::Vendor::Amd;
     info2.logicalProcessors = 16; info2.physicalCores = 8;
-    info2.coreLPs = {0, 2, 99};                           // 越界条目
+    SetCoreReps(info2, {0, 2, 99});                       // 越界条目
     auto probe2 = pd::CreateAmdProbe(io2, info2);
     pd::Sample s2;
     Expect(probe2->readSample(s2), "fallback sample reads");
@@ -715,7 +728,7 @@ void TestAmdProbeTempRangeOffset() {
         io.smn[0x59800] = 0x510B0000u;                    // 实测 idle
         pd::PlatformInfo info; info.vendor = pd::Vendor::Amd;
         info.logicalProcessors = 16; info.physicalCores = 8;
-        info.coreLPs = {0, 2, 4, 6, 8, 10, 12, 14};
+        SetCoreReps(info, {0, 2, 4, 6, 8, 10, 12, 14});
         info.family = 0x1A;
         auto probe = pd::CreateAmdProbe(io, info);
         pd::Sample s;
@@ -737,7 +750,7 @@ void TestAmdProbeTempRangeOffset() {
         io.smn[0x59800] = 640u << 21;                     // 80.0 C,无标志位
         pd::PlatformInfo info; info.vendor = pd::Vendor::Amd;
         info.logicalProcessors = 16; info.physicalCores = 8;
-        info.coreLPs = {0, 2, 4, 6, 8, 10, 12, 14};
+        SetCoreReps(info, {0, 2, 4, 6, 8, 10, 12, 14});
         info.family = 0x19;
         auto probe = pd::CreateAmdProbe(io, info);
         pd::Sample s;
@@ -765,7 +778,7 @@ void TestAmdProbePstateBaseClock() {
         io.msr[0xC0010064] = [] { return 0x334ull; };     // Zen5 P0
         pd::PlatformInfo info; info.vendor = pd::Vendor::Amd;
         info.logicalProcessors = 16; info.physicalCores = 8;
-        info.coreLPs = {0, 2, 4, 6, 8, 10, 12, 14};
+        SetCoreReps(info, {0, 2, 4, 6, 8, 10, 12, 14});
         info.family = 0x1A; info.baseGHz = 0.0;           // CPUID 0x16 缺席
         auto probe = pd::CreateAmdProbe(io, info);
         Expect(std::abs(probe->caps().baseGHz - 4.1) < 0.001,
@@ -788,7 +801,7 @@ void TestAmdProbePstateBaseClock() {
         io.msr[0xC0010064] = [] { return (8ull << 8) | 0xA8ull; };  // 168/8
         pd::PlatformInfo info; info.vendor = pd::Vendor::Amd;
         info.logicalProcessors = 8; info.physicalCores = 4;
-        info.coreLPs = {0, 2, 4, 6};
+        SetCoreReps(info, {0, 2, 4, 6});
         info.family = 0x19; info.baseGHz = 0.0;
         auto probe = pd::CreateAmdProbe(io, info);
         Expect(std::abs(probe->caps().baseGHz - 4.2) < 0.001,
@@ -801,7 +814,7 @@ void TestAmdProbePstateBaseClock() {
         io2.msr[0xC001029B] = [&pkg2] { pkg2 += 32768; return pkg2; };
         pd::PlatformInfo info2; info2.vendor = pd::Vendor::Amd;
         info2.logicalProcessors = 8; info2.physicalCores = 4;
-        info2.coreLPs = {0, 2, 4, 6};
+        SetCoreReps(info2, {0, 2, 4, 6});
         info2.family = 0x19; info2.baseGHz = 0.0;
         auto probe2 = pd::CreateAmdProbe(io2, info2);
         pd::Sample s2;
@@ -834,6 +847,42 @@ void TestSamplerExitsAfterFiveConsecutiveFailures() {
     bool ok = s.Run(-1.0, [&](const pd::Sample&) { ++sinks; });
     Expect(!ok, "five consecutive failures abort the run");
     Expect(sinks == 0, "failed frames never reach the sink");
+}
+
+// ---------- Usage 差分 / TSC 校准 ----------
+class FakeUsageSource : public pd::IUsageSource {
+public:
+    std::vector<std::vector<double>> frames;   // 每帧每 LP busy(已算好)
+    size_t i = 0;
+    bool ReadPerLp(std::vector<double>& out) override {
+        if (i >= frames.size()) return false;
+        out = frames[i++]; return true;
+    }
+};
+void TestUsageMonitorDiff() {
+    // 首帧只建立基线 -> ok=false;第二帧直读
+    auto fake = std::make_unique<FakeUsageSource>();
+    fake->frames = { {50.0, 20.0}, {60.0, 80.0} };
+    pd::UsageMonitor mon(std::move(fake));
+    pd::LpUsage first = mon.Read();
+    Expect(!first.ok, "first frame is baseline only");
+    pd::LpUsage second = mon.Read();
+    Expect(second.ok && second.totalPct == 70.0 && second.maxPct == 80.0, "second frame aggregates");
+}
+void TestNtUsageSourceInstantiates() {   // 只验证可构造+一次调用不崩(真机路径)
+    pd::NtUsageSource src(2);
+    std::vector<double> v;
+    (void)src.ReadPerLp(v);              // CI 无断言;真机验证在 Task 9
+}
+void TestCalibrateTscHzPlausible() {
+    double hz = pd::CalibrateTscHz();
+    Expect(hz > 1e9 && hz < 8e9, "TSC in 1-8 GHz range on this class of hw");
+}
+void TestCoreInfoFallback() {            // PlatformInfo::cores 空时探针退回全 LP 的数据结构约定
+    pd::PlatformInfo info;
+    info.logicalProcessors = 4;
+    info.cores.clear();
+    Expect(info.cores.empty(), "fallback = empty cores (probe synthesizes all-LP)");
 }
 
 // ---------- v3 SensorTable / CSV ----------
@@ -902,6 +951,10 @@ int main() {
     TestAmdProbePstateBaseClock();
     TestSamplerDrivesSinkAndFillsPlatformIndependentFields();
     TestSamplerExitsAfterFiveConsecutiveFailures();
+    TestUsageMonitorDiff();
+    TestNtUsageSourceInstantiates();
+    TestCalibrateTscHzPlausible();
+    TestCoreInfoFallback();
     TestSensorTableBasics();
     TestFormatSensorCell();
     TestCsvV3HeaderAndRow();

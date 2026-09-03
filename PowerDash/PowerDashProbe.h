@@ -53,4 +53,8 @@ std::unique_ptr<IPlatformProbe> CreateAmdProbe(DriverIo& io,
 std::unique_ptr<IPlatformProbe> CreateProbe(DriverIo& io,
                                             const PlatformInfo& info);
 
+// TSC 频率校准(v3 Task 3):~150 ms QPC 对照 __rdtsc;
+// hz = Δtsc * qpcFreq / Δqpc。失败返回 0(调用方退避)。
+double CalibrateTscHz();
+
 } // namespace pd

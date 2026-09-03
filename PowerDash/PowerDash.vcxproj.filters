@@ -36,6 +36,9 @@
     <ClCompile Include="PowerDashUi.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
+    <ClCompile Include="PowerDashUsage.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="PowerDashIoctl.h">
@@ -54,6 +57,9 @@
       <Filter>头文件</Filter>
     </ClInclude>
     <ClInclude Include="PowerDashUi.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="PowerDashUsage.h">
       <Filter>头文件</Filter>
     </ClInclude>
   </ItemGroup>

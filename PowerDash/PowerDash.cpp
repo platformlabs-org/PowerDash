@@ -168,40 +168,54 @@ static unsigned CpuFamily() {
     return ((info[0] >> 8) & 0xF) + ((info[0] >> 20) & 0xFF);
 }
 
-/* Physical-core topology for the PlatformInfo: every
- * RelationProcessorCore entry in GetLogicalProcessorInformation's
- * buffer is exactly one physical core (its ProcessorMask lists that
- * core's SMT siblings). AMD's per-core energy counter 0xC001029A is
- * shared by SMT siblings, so the probe must read one LP per physical
- * core - the representative LP is the mask's lowest set bit. NOTE:
- * Windows enumerates siblings with ADJACENT numbers (measured on
- * labs-tb16g7, 8C/16T: masks 0x0003,0x000C,...,0xC000 -> LP pairs
- * {0,1},{2,3},...), NOT n/n+nCores, so "first nCores LPs" would read
- * only half the cores twice; the representative list comes from the
- * actual masks. Returns false on API failure (callers fall back to
- * logicalProcessors / all-LP scanning). */
-static bool QueryCoreTopology(unsigned& physicalCores,
-                              std::vector<unsigned>& coreLPs) {
-    physicalCores = 0;
-    coreLPs.clear();
+/* V2 物理核拓扑(v3 Task 3):GetLogicalProcessorInformationEx(
+ * RelationProcessorCore)每条目恰为一个物理核,PROCESSOR_RELATIONSHIP 额外
+ * 给出 EfficiencyClass(hybrid 性能/能效分级)与 GroupMask[](该核全部
+ * SMT 兄弟)。LP 号 = 组内 mask 位序;单组机器即全机平铺编号。跨组机器
+ * (GroupCount>1 或 mask 落在非 0 组)需按组基址换算编号,本版直接返回
+ * false,调用方退回"cores 空 = 全 LP"保底。repLP = threads 最小值
+ * (mask 最低置位位;Windows SMT 兄弟编号相邻,8C/16T 为 {0,1}{2,3}…,
+ * 代表集 = {0,2,4,6,8,10,12,14},详见 PowerDashModel.h CoreInfo 注释)。 */
+static bool QueryCoreTopologyV2(std::vector<pd::CoreInfo>& cores) {
+    cores.clear();
     DWORD bytes = 0;
-    if (GetLogicalProcessorInformation(nullptr, &bytes) ||
+    if (GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr,
+                                         &bytes) ||
         GetLastError() != ERROR_INSUFFICIENT_BUFFER || bytes == 0)
         return false;
-    std::vector<SYSTEM_LOGICAL_PROCESSOR_INFORMATION> buf(
-        bytes / sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION));
-    if (!GetLogicalProcessorInformation(buf.data(), &bytes))
+    std::vector<BYTE> buf(bytes);
+    if (!GetLogicalProcessorInformationEx(
+            RelationProcessorCore,
+            reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(
+                buf.data()),
+            &bytes))
         return false;
-    for (const auto& e : buf) {
-        if (e.Relationship != RelationProcessorCore)
+    for (DWORD off = 0; off + sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)
+                         <= bytes; ) {
+        auto* e = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(
+            buf.data() + off);
+        if (e->Relationship != RelationProcessorCore) {
+            if (e->Size == 0) break;
+            off += e->Size;
             continue;
-        ++physicalCores;
-        DWORD_PTR m = e.ProcessorMask;
-        unsigned lp = 0;
-        while (m != 0 && (m & 1) == 0) { m >>= 1; ++lp; }
-        coreLPs.push_back(lp);
+        }
+        const PROCESSOR_RELATIONSHIP& r = e->Processor;
+        pd::CoreInfo ci;
+        ci.effClass = r.EfficiencyClass;   // 仅 RelationProcessorCore 有效
+        for (WORD g = 0; g < r.GroupCount; ++g) {
+            if (r.GroupMask[g].Group != 0) return false;   // 跨组:不支持
+            const KAFFINITY mask = r.GroupMask[g].Mask;
+            for (unsigned bit = 0; bit < 64; ++bit)
+                if (mask & ((KAFFINITY)1 << bit))
+                    ci.threads.push_back(bit);
+        }
+        if (ci.threads.empty()) return false;
+        ci.repLP = *std::min_element(ci.threads.begin(), ci.threads.end());
+        cores.push_back(std::move(ci));
+        if (e->Size == 0) break;
+        off += e->Size;
     }
-    return physicalCores > 0;
+    return !cores.empty();
 }
 
 struct PCICFG_Request {
@@ -730,12 +744,14 @@ static int RunMonitor(int argc, char* argv[],
     info.vendor = CpuVendor();
     info.cpuName = cpuLine;
     info.logicalProcessors = std::thread::hardware_concurrency();
-    if (!QueryCoreTopology(info.physicalCores, info.coreLPs) ||
-        info.physicalCores > info.logicalProcessors) {
-        /* API 失败/离谱值兜底:physicalCores = nLP、代表集留空(探针
-         * 退回全 LP 遍历,旧行为) */
+    if (!QueryCoreTopologyV2(info.cores) ||
+        info.cores.size() > info.logicalProcessors) {
+        /* API 失败/跨组/离谱值兜底:cores 留空(探针退回全 LP 遍历,
+         * 旧行为),physicalCores = nLP 供 UI。 */
+        info.cores.clear();
         info.physicalCores = info.logicalProcessors;
-        info.coreLPs.clear();
+    } else {
+        info.physicalCores = (unsigned)info.cores.size();
     }
     info.family = CpuFamily();
     info.baseGHz = baseMHz / 1000.0;

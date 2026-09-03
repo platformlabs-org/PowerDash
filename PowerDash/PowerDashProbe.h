@@ -4,6 +4,8 @@
 
 namespace pd {
 
+class SensorTable;   // v3 宽表(PowerDashSensors.h);接口层只出指针,不引入定义
+
 // 驱动 IO 原语抽象:生产环境包装 DeviceIoControl(WindowsDriverIo),
 // 测试中用 FixtureDriverIo 注入应答。SMN 访问必须走 ReadSmn/WriteSmn
 // (驱动内原子互斥的 IO_CTL_SMN_READ/WRITE),禁止用户态拆写 0x60/0x64。
@@ -42,6 +44,9 @@ public:
     virtual ~IPlatformProbe() = default;
     virtual const PlatformCaps& caps() const = 0;
     virtual bool readSample(Sample& s) = 0;   // false = 本帧无任何有效功率域
+    // v3 宽表访问器:宽表探针返回内部 SensorTable(构造期定列,每帧
+    // Set 回填);保底探针保持默认 nullptr(CSV/渲染层按缺席降级)。
+    virtual SensorTable* sensors() { return nullptr; }
 };
 
 std::unique_ptr<IPlatformProbe> CreateIntelProbe(DriverIo& io,

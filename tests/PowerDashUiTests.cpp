@@ -367,10 +367,18 @@ void TestModelDecompositionIdentities() {
     Expect(e.identity == "CORES + GFX + REST = PKG", "amd identity");
 }
 
-class FixtureDriverIo : public pd::DriverIo {   // 可编程应答,probe 回放测试用
+// v3 Task 4:FixtureDriverIo 换用 (core, msr) 静态值表(单核差异化;动态
+// 演进由测试在两拍之间改表模拟 —— 探针 ctor 读基线、测试 bump 后帧读差分)。
+// 保留 msrFailure/failAllMsrs;WriteSmn 记录 smnWrites(Task 1 契约),
+// smnReadHook 供后续 AMD PMTable 邮箱轮询;MapPhys 发放假物理内存。
+class FixtureDriverIo : public pd::DriverIo {
 public:
-    std::map<uint32_t, std::function<uint64_t()>> msr;   // msr -> 每次读取的值
-    std::map<uint32_t, uint32_t> smn;                    // smn addr -> value
+    std::map<std::pair<unsigned, uint32_t>, uint64_t> msrPerCore;  // (core,msr)->值
+    std::map<uint32_t, uint32_t> smn;                              // smn addr -> value
+    std::map<uint32_t, uint32_t> smnWrites;                        // addr -> 最后写入值
+    std::function<uint32_t(uint32_t addr)> smnReadHook;            // 动态 SMN(邮箱轮询)
+    std::vector<uint8_t> physMem;                                  // 假物理内存
+    uint64_t mapPhysBase = 0;
     // 可选:按 (core, msr) 脚本化读取失败(单核单次注入用)。真实硬件的
     // 计数器在读取失败期间照常前进,故钩子需自行推进 fixture 计数器。
     std::function<bool(unsigned core, uint32_t msr)> msrFailure;
@@ -378,20 +386,23 @@ public:
     bool ReadMsr(unsigned core, uint32_t a, uint64_t& out) override {
         if (failAllMsrs) return false;
         if (msrFailure && msrFailure(core, a)) return false;
-        auto it = msr.find(a);
-        if (it == msr.end()) return false;
-        out = it->second();
-        return true;
+        auto it = msrPerCore.find({core, a});
+        if (it == msrPerCore.end()) return false;
+        out = it->second; return true;
     }
     bool ReadPciCfg(unsigned, unsigned, unsigned, unsigned, uint32_t&) override { return false; }
     bool WritePciCfg(unsigned, unsigned, unsigned, unsigned, uint32_t) override { return false; }
     bool ReadSmn(uint32_t a, uint32_t& out) override {
+        if (smnReadHook) { out = smnReadHook(a); return true; }
         auto it = smn.find(a);
         if (it == smn.end()) return false;
         out = it->second; return true;
     }
-    bool WriteSmn(uint32_t, uint32_t) override { return false; }   // 后续任务扩展为可编程
-    bool MapPhys(uint64_t, size_t, void*&) override { return false; }
+    bool WriteSmn(uint32_t a, uint32_t v) override { smnWrites[a] = v; return true; }
+    bool MapPhys(uint64_t phys, size_t len, void*& virt) override {
+        if (physMem.size() < len) return false;
+        mapPhysBase = phys; virt = physMem.data(); return true;  // 页内偏移 0(测试构造保证)
+    }
     void UnmapPhys(void*) override {}
 };
 
@@ -419,27 +430,38 @@ public:
 
 void TestDriverIoFixtureRouting() {
     FixtureDriverIo io;
-    io.msr[0x611] = [] { return 12345ull; };
+    io.msrPerCore[{0, 0x611}] = 12345;
     uint64_t v = 0;
     Expect(io.ReadMsr(0, 0x611, v) && v == 12345, "fixture msr scripted answer");
+    Expect(!io.ReadMsr(1, 0x611, v), "per-(core,msr) keying isolates cores");
     Expect(!io.ReadMsr(0, 0x999, v), "fixture unknown msr fails");
+    Expect(io.WriteSmn(0x3B10A20, 0x66) && io.smnWrites[0x3B10A20] == 0x66,
+           "WriteSmn recorded into smnWrites");
+    io.smnReadHook = [](uint32_t a) { return a + 1; };
+    uint32_t s = 0;
+    Expect(io.ReadSmn(0x10, s) && s == 0x11, "smnReadHook dynamic answer");
+    io.smnReadHook = nullptr;
+    io.physMem.assign(0x1000, 0);
+    void* p = nullptr;
+    Expect(io.MapPhys(0xFED10000ull, 0x1000, p) && p == io.physMem.data() &&
+               io.mapPhysBase == 0xFED10000ull,
+           "MapPhys hands out the fake physical memory");
+    Expect(!io.MapPhys(0x1000, 0x2000, p), "MapPhys rejects oversized requests");
 }
 
 void TestIntelProbeReplay() {
+    // v3:静态 (core,msr) 表两拍用法 —— ctor 建基线,测试 bump 后帧读差分。
     FixtureDriverIo io;
-    // 单位寄存器:power bits=3(0.125W), energy bits=14(1/16384 J), time bits=10
-    io.msr[0x606] = [] { return (14ull << 8) | 3ull; };
-    uint64_t pkg = 0;   // 每 tick 增 32768 raw = 2.0 J -> 2 W
-    io.msr[0x611] = [&pkg] { pkg += 32768; return pkg; };
-    uint64_t pp0 = 0;   // 每 tick 增 16384 raw = 1.0 J -> 1 W
-    io.msr[0x639] = [&pp0] { pp0 += 16384; return pp0; };
-    uint64_t pp1 = 0, sys = 0;
-    io.msr[0x641] = [&pp1] { pp1 += 8192; return pp1; };   // 0.5 W
-    io.msr[0x64D] = [&sys] { sys += 49152; return sys; };  // 3.0 W
+    // 单位寄存器:power bits=3(0.125W), energy bits=14(1/16384 J)
+    io.msrPerCore[{0, 0x606}] = (14ull << 8) | 3ull;
+    io.msrPerCore[{0, 0x611}] = 0;   // 能量四域基线 0
+    io.msrPerCore[{0, 0x639}] = 0;
+    io.msrPerCore[{0, 0x641}] = 0;
+    io.msrPerCore[{0, 0x64D}] = 0;
     // 温度:MSR_PACKAGE_THERM_STATUS 实为 0x1B1(PowerDash.cpp:43,
     // brief 的 0x613 是笔误);valid bit31 + headroom 31 -> 105-31=74 C
-    io.msr[0x1B1] = [] { return (1ull << 31) | (0x1Full << 16); };
-    io.msr[0x1A2] = [] { return 105ull << 16; };           // TjMax=105
+    io.msrPerCore[{0, 0x1B1}] = (1ull << 31) | (0x1Full << 16);
+    io.msrPerCore[{0, 0x1A2}] = 105ull << 16;           // TjMax=105
     pd::PlatformInfo info; info.vendor = pd::Vendor::Intel;
     info.cpuName = "Intel(R) Core(TM) Ultra 5 225H  [Arrow Lake-H]";
     info.logicalProcessors = 16; info.baseGHz = 2.5;
@@ -447,7 +469,11 @@ void TestIntelProbeReplay() {
     Expect(probe != nullptr, "intel probe constructs");
     Expect(probe->caps().vendor == pd::Vendor::Intel &&
            probe->caps().tjMaxC == 105, "caps carry tjMax");
-    // 构造期已消费一次 prev;第一帧即得到差分功率
+    // 构造期已建基线;bump 后第一帧即得到差分功率
+    io.msrPerCore[{0, 0x611}] = 32768;   // +32768 raw = 2.0 W
+    io.msrPerCore[{0, 0x639}] = 16384;   // +16384 raw = 1.0 W
+    io.msrPerCore[{0, 0x641}] = 8192;    // 0.5 W
+    io.msrPerCore[{0, 0x64D}] = 49152;   // 3.0 W
     pd::Sample s;
     Expect(probe->readSample(s), "first sample reads");
     Expect(s.pkgW.valid && std::abs(s.pkgW.value - 2.0) < 0.01,
@@ -462,57 +488,250 @@ void TestIntelProbeReplay() {
     // MCHBAR/MMAP 在 FixtureDriverIo 下失败 -> 能力降级,不是构造失败
     Expect(!probe->caps().powerLimits, "MCHBAR unavailable degrades powerLimits");
     Expect(!s.powerLimit.sustainedW.valid && !s.powerLimit.burstW.valid,
-           "PL readings stay invalid without the MMIO window");
-    // APERF/MPERF 未脚本化 -> 频率无效
-    Expect(!s.freqGHz.valid, "APERF/MPERF unscripted leaves freq invalid");
+           "PL readings stay invalid without MMIO or static 0x610");
+    // 0x198 未脚本化 -> 无时钟列 -> 频率无效
+    Expect(!s.freqGHz.valid, "PERF_STATUS unscripted leaves freq invalid");
 }
 
 void TestIntelProbeEnergyWraparound() {
     FixtureDriverIo io;
-    io.msr[0x606] = [] { return (14ull << 8) | 3ull; };   // 1/16384 J
-    uint64_t pkg = 0xFFFFFD00ull;   // 模拟 32 位能量计数器跨 2^32 回绕
-    io.msr[0x611] = [&pkg] { pkg = (pkg + 0x200) & 0xFFFFFFFFull; return pkg; };
+    io.msrPerCore[{0, 0x606}] = (14ull << 8) | 3ull;   // 1/16384 J
+    io.msrPerCore[{0, 0x611}] = 0xFFFFFF00ull;   // ctor 基线读到的 32 位计数器
     pd::PlatformInfo info; info.vendor = pd::Vendor::Intel;
     auto probe = pd::CreateIntelProbe(io, info);
+    io.msrPerCore[{0, 0x611}] = 0x100;           // 本帧回绕到 2^32 附近
     pd::Sample s;
     Expect(probe->readSample(s), "wraparound sample reads");
-    // ctor 基线读得 prev = 0xFFFFFF00;本帧读回绕到 0x100 < prev,
+    // ctor 基线 prev = 0xFFFFFF00;本帧读回绕到 0x100 < prev,
     // 走 curr += 1<<32 分支后差分 = 0x100000100 - 0xFFFFFF00 = 0x200
     Expect(s.pkgW.valid && std::abs(s.pkgW.value - (512.0 / 16384.0)) < 0.0001,
            "32-bit energy wraparound adds 1<<32 to the delta");
 }
 
-// ---- Task 8: AmdProbe(保底监控集)----
-
-// AMD 逐核能量 fixture:实现按"每帧遍历 core 0..nLP-1 各读一次
-// 0xC001029A、各自独立差分"的语义采样;fixture 依调用序号把读数路由到
-// perCore[c],模拟每个核自己的 32 位计数器(ctor 基线一圈、readSample 一圈)。
-// 若实现误用单一共享计数器,基线在圈中间被取走,每核差分会放大 n 倍。
-struct AmdCoreEnergy {
-    AmdCoreEnergy(unsigned n, uint64_t step, uint64_t seed = 0)
-        : n_(n), step_(step), v_(n, seed) {}
-    uint64_t operator()() {
-        unsigned c = calls_++ % n_;
-        v_[c] = (v_[c] + step_) & 0xFFFFFFFFull;   // 32 位计数器回绕语义
-        return v_[c];
+// ---- Task 4: Intel 探针宽表(经 IPlatformProbe 接口消费,不向下转型)----
+void TestIntelProbeWideTable() {
+    // 基础:RAPL 单位 energy bits=16(1/65536 J)、power bits=3(0.125 W)、
+    // time bits=11(2^-11 s);能量计数器帧间差 0x10000 raw = 1.0 J -> 1 W。
+    FixtureDriverIo io;
+    io.msrPerCore[{0, 0x606}] = (16ull << 8) | 3ull | (11ull << 16);
+    io.msrPerCore[{0, 0x614}] = 0x2FF;   // thermal spec 0x2FF*0.125 = 95.875 W
+    io.msrPerCore[{0, 0x611}] = 0;       // 能量四域基线 0
+    io.msrPerCore[{0, 0x639}] = 0;
+    io.msrPerCore[{0, 0x641}] = 0;
+    io.msrPerCore[{0, 0x64D}] = 0;
+    io.msrPerCore[{0, 0x1A2}] = 105ull << 16;   // LP0 TjMax(core1 走回退路径)
+    io.msrPerCore[{0, 0xCE}] = 32ull << 8;      // 最大非睿频倍频 32 -> bus=TSC/32
+    io.msrPerCore[{0, 0x1B1}] = (1ull << 31) | (8ull << 16);   // 包温 readout 8
+    io.msrPerCore[{0, 0x610}] = 224ull /*PL1 28W*/ | (1ull << 15) |
+                                (10ull << 17) /*tau 10*/ | (1ull << 31) /*locked*/ |
+                                (368ull << 32) /*PL2 46W*/ | (1ull << 47);
+    io.msrPerCore[{0, 0x64B}] = 1;               // cTDP level 1
+    io.msrPerCore[{0, 0x64F}] = 1ull << 25;      // IA log 位 16+9(Max Turbo Limit)
+    io.msrPerCore[{0, 0x650}] = 0;
+    io.msrPerCore[{0, 0x651}] = 0;
+    for (unsigned c = 0; c < 2; ++c) {
+        io.msrPerCore[{c, 0x198}] = (40ull << 8) | (5734ull << 32);  // 倍频 40/VID 5734
+        io.msrPerCore[{c, 0x19C}] = (1ull << 31) | (5ull << 16) | (1ull << 1);  // readout 5+thermal log
+        io.msrPerCore[{c, 0x660}] = 0;    // C1 驻留可读(恒 0)
+        io.msrPerCore[{c, 0x3FD}] = 0;    // C6 驻留可读(恒 0)
+        io.msrPerCore[{c, 0xE8}] = 0;     // APERF/MPERF 恒 0 ->
+        io.msrPerCore[{c, 0xE7}] = 0;     //   eff/C0 差分恒 0%
     }
-    unsigned n_;
-    unsigned calls_ = 0;
-    uint64_t step_;
-    std::vector<uint64_t> v_;
-};
+    pd::PlatformInfo info;
+    info.vendor = pd::Vendor::Intel;
+    info.logicalProcessors = 2;
+    info.cores = { {0, {0}, 0}, {1, {1}, 1} };   // P0 + E1(核名区分 effClass)
+    info.baseGHz = 0;
+    const double tscHz = pd::CalibrateTscHz();   // 独立测 TSC,断言 bus 公式
+    auto probe = pd::CreateIntelProbe(io, info);
+    pd::SensorTable* t = probe->sensors();
+    Expect(t != nullptr, "intel probe exposes its wide table");
+    Expect(probe->caps().tjMaxC == 105, "caps tjMax from 0x1A2");
+    Expect(std::abs(probe->caps().budgetW - 95.875) < 1e-9,
+           "budgetW = thermal spec 0x2FF*0.125");
+    Expect(probe->caps().gfxPower && probe->caps().platformPower,
+           "energy domain ctor probes set caps honestly");
+    Expect(probe->caps().residency, "residency caps when C-state columns exist");
+
+    // 列名 = HWiNFO 原文(effClass 0 -> "P-core n"、1 -> "E-core n",编号 = repLP)
+    int i = -1;
+    Expect((i = t->Find("clock.0")) >= 0 &&
+               t->Column(i).name == "P-core 0 Clock [MHz]",
+           "core 0 uses P-core naming");
+    Expect((i = t->Find("clock.1")) >= 0 &&
+               t->Column(i).name == "E-core 1 Clock [MHz]",
+           "core 1 uses E-core naming");
+    Expect((i = t->Find("cores.c0.lp1")) >= 0 &&
+               t->Column(i).name == "E-core 1 T0 C0 Residency [%]",
+           "per-thread C0 uses HWiNFO T0 naming");
+    Expect((i = t->Find("temp.pkg")) >= 0 &&
+               t->Column(i).name == "CPU Package [°C]",
+           "package temp column name");
+    // 组序:电压->时钟->有效->Usage->Utility->Ratio->温度->降频->功率->限值->核驻留->Limit Reasons
+    Expect(t->Find("vid.avg") < t->Find("clock.avg") &&
+               t->Find("clock.avg") < t->Find("eff.avg") &&
+               t->Find("eff.avg") < t->Find("usage.avg") &&
+               t->Find("usage.avg") < t->Find("util.avg") &&
+               t->Find("util.avg") < t->Find("ratio.avg") &&
+               t->Find("ratio.avg") < t->Find("temp.avg") &&
+               t->Find("temp.avg") < t->Find("thr.pkg.thermal") &&
+               t->Find("thr.pkg.thermal") < t->Find("power.pkg") &&
+               t->Find("power.pkg") < t->Find("pl1.static") &&
+               t->Find("pl1.static") < t->Find("cores.c0.avg") &&
+               t->Find("cores.c0.avg") < t->Find("lim.ia.avg"),
+           "column groups follow the HWiNFO sample order");
+
+    // 两拍:ctor 基线 -> bump -> readSample(能量差分每拍 1.0 W)
+    auto bump = [&io] {
+        io.msrPerCore[{0, 0x611}] += 0x10000;
+        io.msrPerCore[{0, 0x639}] += 0x10000;
+        io.msrPerCore[{0, 0x641}] += 0x10000;
+        io.msrPerCore[{0, 0x64D}] += 0x10000;
+    };
+    pd::Sample s;
+    bump();
+    Expect(probe->readSample(s), "beat 1 reads");
+    pd::Sample s2;
+    bump();
+    Expect(probe->readSample(s2), "beat 2 reads");
+    pd::SensorTable& tb = *t;
+
+    // 电压:VID = 0x198 EDX[15:0]/8192 -> 5734/8192
+    const double vid = 5734.0 / 8192.0;
+    Expect(tb.Lookup("vid.0").valid && std::abs(tb.Lookup("vid.0").value - vid) < 1e-9,
+           "vid.0 = 5734/8192");
+    Expect(tb.Lookup("vid.avg").valid && std::abs(tb.Lookup("vid.avg").value - vid) < 1e-9,
+           "vid.avg = mean over cores");
+    // 时钟:bus = 实测 TSC / 0xCE 倍频;clock.N = 倍频 x bus;ratio = 40
+    const pd::Reading bus = tb.Lookup("clock.bus");
+    const double busExp = tscHz / 32.0 / 1e6;
+    Expect(bus.valid && std::abs(bus.value - busExp) < 0.02 * busExp,
+           "bus = CalibrateTscHz()/0xCE ratio");
+    Expect(bus.value > 90.0 && bus.value < 130.0,
+           "bus in BCLK band (host TSC 3686.4 MHz at ratio 32 -> 115.2)");
+    Expect(tb.Lookup("clock.0").valid &&
+               std::abs(tb.Lookup("clock.0").value - 40.0 * bus.value) <
+                   0.01 * 40.0 * bus.value,
+           "clock.0 = ratio 40 x bus");
+    Expect(tb.Lookup("clock.avg").valid &&
+               std::abs(tb.Lookup("clock.avg").value - 40.0 * bus.value) <
+                   0.01 * 40.0 * bus.value,
+           "clock.avg = mean over cores");
+    Expect(tb.Lookup("ratio.0").valid && std::abs(tb.Lookup("ratio.0").value - 40.0) < 1e-9,
+           "ratio.0 = 40");
+    // 温度:readout 5 -> temp = 105-5;距离列 = 5;包温 105-8
+    Expect(tb.Lookup("temp.0").valid && std::abs(tb.Lookup("temp.0").value - 100.0) < 1e-9,
+           "temp.0 = TjMax - 5");
+    Expect(tb.Lookup("tjmax.0").valid && std::abs(tb.Lookup("tjmax.0").value - 5.0) < 1e-9,
+           "tjmax.0 distance = 5");
+    Expect(tb.Lookup("temp.avg").valid && std::abs(tb.Lookup("temp.avg").value - 100.0) < 1e-9,
+           "temp.avg = 100");
+    Expect(tb.Lookup("temp.coremax").valid &&
+               std::abs(tb.Lookup("temp.coremax").value - 100.0) < 1e-9,
+           "temp.coremax = 100");
+    Expect(tb.Lookup("temp.pkg").valid && std::abs(tb.Lookup("temp.pkg").value - 97.0) < 1e-9,
+           "temp.pkg = 105-8");
+    // 降频位:0x19C log 位 1/5/11;avg = OR;包级三位全 0
+    Expect(tb.Lookup("thr.0.thermal").valid && tb.Lookup("thr.0.thermal").value == 1.0,
+           "thr.0.thermal = log bit 1");
+    Expect(tb.Lookup("thr.avg.thermal").valid && tb.Lookup("thr.avg.thermal").value == 1.0,
+           "thr.avg.thermal = OR over cores");
+    Expect(tb.Lookup("thr.0.crit").valid && tb.Lookup("thr.0.crit").value == 0.0,
+           "thr.0.crit = 0");
+    Expect(tb.Lookup("thr.0.plim").valid && tb.Lookup("thr.0.plim").value == 0.0,
+           "thr.0.plim = 0");
+    Expect(tb.Lookup("thr.pkg.thermal").valid && tb.Lookup("thr.pkg.thermal").value == 0.0,
+           "package thermal = 0");
+    // PL 静态 0x610:224x0.125=28、368x0.125=46;动态列 MMIO 缺席 -> NA
+    Expect(tb.Lookup("pl1.static").valid &&
+               std::abs(tb.Lookup("pl1.static").value - 28.0) < 1e-9,
+           "pl1.static = 224*0.125");
+    Expect(tb.Lookup("pl2.static").valid &&
+               std::abs(tb.Lookup("pl2.static").value - 46.0) < 1e-9,
+           "pl2.static = 368*0.125");
+    Expect(!tb.Lookup("pl1.dynamic").valid && !tb.Lookup("pl2.dynamic").valid,
+           "dynamic PL NA without MMIO window");
+    Expect(tb.Lookup("ctdp.level").valid && tb.Lookup("ctdp.level").value == 1.0,
+           "ctdp.level = 0x64B[1:0]");
+    // Limit Reasons:0x64F log 位 16+9 -> lim.ia.9;avg = OR
+    Expect(tb.Lookup("lim.ia.9").valid && tb.Lookup("lim.ia.9").value == 1.0,
+           "lim.ia.9 = Max Turbo Limit log bit");
+    Expect(tb.Lookup("lim.ia.avg").valid && tb.Lookup("lim.ia.avg").value == 1.0,
+           "lim.ia.avg = OR of all bits (bit 9 set -> Yes)");
+    Expect(tb.Lookup("lim.gt.0").valid && tb.Lookup("lim.gt.0").value == 0.0,
+           "lim.gt.0 = 0");
+    // 能量:每拍 +0x10000 raw x 1/65536 J = 1.0 W(1 s 窗口约定)
+    for (const char* k : {"power.pkg", "power.ia", "power.gt", "power.sys"})
+        Expect(tb.Lookup(k).valid && std::abs(tb.Lookup(k).value - 1.0) < 1e-6,
+               "power domain decodes to 1.0 W");
+    // 驻留/有效:fixture 恒 0 差 -> C1/C6/C0/eff 全 0 但有效
+    Expect(tb.Lookup("cores.c1.avg").valid && tb.Lookup("cores.c1.avg").value == 0.0,
+           "cores.c1.avg = 0");
+    Expect(tb.Lookup("cores.c6.avg").valid && tb.Lookup("cores.c6.avg").value == 0.0,
+           "cores.c6.avg = 0");
+    Expect(tb.Lookup("cores.c0.lp0").valid && tb.Lookup("cores.c0.lp0").value == 0.0,
+           "cores.c0.lp0 = dMPERF/dTSC = 0");
+    Expect(tb.Lookup("eff.all").valid && tb.Lookup("eff.all").value == 0.0,
+           "eff = dAPERF/dTSC = 0");
+    // Usage:真源双基线暖机,前两拍 NA(暖机期不猜值)
+    Expect(!tb.Lookup("usage.total").valid && !tb.Lookup("usage.avg").valid,
+           "usage NA during warm-up frames");
+    // 无脚本项 -> 诚实 NA/省列
+    Expect(!tb.Lookup("usage.clockmod").valid, "clockmod unscripted -> NA");
+    Expect(t->Find("cores.c7.avg") < 0, "C7 unreadable at probe -> column omitted");
+    Expect(t->Find("pkgres.c2") < 0, "package residency unreadable -> omitted");
+    // Sample 派生:同键单条写路径(表值 == Sample 值)
+    Expect(s2.pkgW.valid && std::abs(s2.pkgW.value - tb.Lookup("power.pkg").value) < 1e-12,
+           "Sample pkgW == power.pkg");
+    Expect(s2.coresW.valid && std::abs(s2.coresW.value - 1.0) < 1e-6,
+           "Sample coresW == power.ia");
+    Expect(s2.tempC.valid && s2.tempC.value == 97.0, "Sample tempC == temp.pkg");
+    Expect(s2.freqGHz.valid &&
+               std::abs(s2.freqGHz.value - tb.Lookup("clock.avg").value / 1000.0) < 1e-9,
+           "Sample freq = clock.avg/1000");
+    Expect(s2.powerLimit.sustainedW.valid &&
+               std::abs(s2.powerLimit.sustainedW.value - 28.0) < 1e-9,
+           "sustainedW = dynamic-first, static fallback");
+    Expect(s2.powerLimit.burstW.valid &&
+               std::abs(s2.powerLimit.burstW.value - 46.0) < 1e-9,
+           "burstW = static fallback");
+    Expect(s2.powerLimit.sustainedWindowS.valid &&
+               std::abs(s2.powerLimit.sustainedWindowS.value - 10.0 / 2048.0) < 1e-12,
+           "tau = 10*2^-11 s");
+    Expect(s2.powerLimit.locked, "locked from 0x610 bit31");
+    Expect(!s2.utilPct.valid, "utilPct NA while usage warms up");
+    Expect(!s2.c0Pct.valid && !s2.c2Pct.valid && !s2.c6Pct.valid,
+           "package residency NA -> c0/c2/c6 NA");
+
+    // 第三拍:抽走 0x64F -> Limit Reasons 列回 NA(帧首 SetInvalid 全表,
+    // 失败读取不残留旧值);能量照常 bump,帧仍成立
+    io.msrPerCore.erase({0, 0x64F});
+    bump();
+    pd::Sample s3;
+    Expect(probe->readSample(s3), "beat 3 reads");
+    Expect(!tb.Lookup("lim.ia.9").valid,
+           "failed read leaves NA (no stale value from previous frame)");
+    Expect(tb.Lookup("power.pkg").valid &&
+               std::abs(tb.Lookup("power.pkg").value - 1.0) < 1e-6,
+           "healthy columns keep decoding on the degraded frame");
+}
+
+// ---- Task 8: AmdProbe(保底监控集)----
+// v3 Task 4:能量 fixture 改用静态 (core,msr) 表两拍法 —— ctor 基线一圈读
+// repLP 集合,测试在帧前 bump 表值模拟每个核自己的 32 位计数器前进;若实
+// 现误读 SMT 兄弟或越界 LP,对应 (core,msr) 无表项 -> 读取失败,数值断言
+// 立即暴露。动态推进(读取失败但计数器照走)由 msrFailure 钩子改表实现。
 
 void TestAmdProbeReplay() {
     FixtureDriverIo io;
     // 单位寄存器 0xC0010299 与 Intel 0x606 位兼容(turbostat: energy bits
     // 8-12):energy bits=14 -> 1/16384 J
-    io.msr[0xC0010299] = [] { return 14ull << 8; };
-    uint64_t pkg = 0;   // 每读 +32768 raw = 2.0 J -> 2.0 W
-    io.msr[0xC001029B] = [&pkg] { pkg += 32768; return pkg; };
+    io.msrPerCore[{0, 0xC0010299}] = 14ull << 8;
+    io.msrPerCore[{0, 0xC001029B}] = 0;   // pkg 基线 0
     // 8 物理核(0xC001029A 按物理核计数,SMT 兄弟共享 -> 每核只读一个
     // 代表 LP)每帧各 +2048 raw -> 合计 8*2048 = 16384 raw = 1.0 W
-    AmdCoreEnergy coreEnergy(8, 2048);
-    io.msr[0xC001029A] = [&coreEnergy] { return coreEnergy(); };
+    const unsigned reps[8] = {0, 2, 4, 6, 8, 10, 12, 14};
+    for (unsigned lp : reps) io.msrPerCore[{lp, 0xC001029A}] = 0;
     io.smn[0x59800] = 640u << 21;   // Tctl: 640 * 0.125 = 80.0 C(无 RANGE_SEL)
     pd::PlatformInfo info; info.vendor = pd::Vendor::Amd;
     info.cpuName = "AMD Ryzen 7 8845H  [Hawk Point]";
@@ -528,6 +747,8 @@ void TestAmdProbeReplay() {
            c.cpuName == "AMD Ryzen 7 8845H  [Hawk Point]" &&
            std::abs(c.baseGHz - 3.8) < 0.01, "amd caps carry identity");
     Expect(c.tjMaxC == 0 && c.budgetW == 0.0, "amd leaves tjMax/budget unknown");
+    io.msrPerCore[{0, 0xC001029B}] = 32768;   // +32768 raw = 2.0 W
+    for (unsigned lp : reps) io.msrPerCore[{lp, 0xC001029A}] = 2048;
     pd::Sample s;
     Expect(probe->readSample(s), "amd sample reads");
     Expect(s.pkgW.valid && std::abs(s.pkgW.value - 2.0) < 0.01,
@@ -544,11 +765,11 @@ void TestAmdProbeReplay() {
 void TestAmdProbeEnergyWraparound() {
     {   // pkg 计数器跨 2^32 回绕;nLP=0 边缘 -> cores 无读数保持 NA
         FixtureDriverIo io;
-        io.msr[0xC0010299] = [] { return 14ull << 8; };   // 1/16384 J
-        uint64_t pkg = 0xFFFFFD00ull;   // 模拟 32 位能量计数器跨 2^32 回绕
-        io.msr[0xC001029B] = [&pkg] { pkg = (pkg + 0x200) & 0xFFFFFFFFull; return pkg; };
+        io.msrPerCore[{0, 0xC0010299}] = 14ull << 8;   // 1/16384 J
+        io.msrPerCore[{0, 0xC001029B}] = 0xFFFFFF00ull;   // ctor 基线读到的
         pd::PlatformInfo info; info.vendor = pd::Vendor::Amd;   // nLP=0
         auto probe = pd::CreateAmdProbe(io, info);
+        io.msrPerCore[{0, 0xC001029B}] = 0x100;   // 本帧回绕到 2^32 附近
         pd::Sample s;
         Expect(probe->readSample(s), "pkg-only sample reads");
         // ctor 基线 prev = 0xFFFFFF00;本帧回绕到 0x100 < prev,
@@ -557,17 +778,18 @@ void TestAmdProbeEnergyWraparound() {
                "32-bit pkg wraparound adds 1<<32 to delta");
         Expect(!s.coresW.valid, "zero logical processors leaves cores NA");
     }
-    {   // 逐核独立回绕:4 核全部从 2^32-512 起步,每读 +0x200
+    {   // 逐核独立回绕:4 核 ctor 基线均为 0xFFFFFF00,本帧回绕到 0x100
         // (nLP=4/physicalCores=4:无 SMT,代表集即全部 4 个 LP)
         FixtureDriverIo io;
-        io.msr[0xC0010299] = [] { return 14ull << 8; };
-        AmdCoreEnergy coreEnergy(4, 0x200, 0xFFFFFD00ull);
-        io.msr[0xC001029A] = [&coreEnergy] { return coreEnergy(); };
+        io.msrPerCore[{0, 0xC0010299}] = 14ull << 8;
+        for (unsigned c = 0; c < 4; ++c)
+            io.msrPerCore[{c, 0xC001029A}] = 0xFFFFFF00ull;
         pd::PlatformInfo info; info.vendor = pd::Vendor::Amd;
         info.logicalProcessors = 4; info.physicalCores = 4;
         SetCoreReps(info, {0, 1, 2, 3});
         info.baseGHz = 3.8;
         auto probe = pd::CreateAmdProbe(io, info);
+        for (unsigned c = 0; c < 4; ++c) io.msrPerCore[{c, 0xC001029A}] = 0x100;
         pd::Sample s;
         Expect(probe->readSample(s), "per-core wraparound sample reads");
         // 每核 delta = 0x200,4 核合计 0x800 = 2048 raw -> 2048/16384 = 0.125 W
@@ -580,7 +802,7 @@ void TestAmdProbeEnergyWraparound() {
 void TestAmdProbeDegradesAndFuses() {
     {   // 能量域全缺失 -> 熔断返回 false(温度/频率同步缺失亦为 NA)
         FixtureDriverIo io;
-        io.msr[0xC0010299] = [] { return 14ull << 8; };   // 单位可用
+        io.msrPerCore[{0, 0xC0010299}] = 14ull << 8;   // 单位可用
         pd::PlatformInfo info; info.vendor = pd::Vendor::Amd;
         info.logicalProcessors = 16; info.baseGHz = 3.8;
         auto probe = pd::CreateAmdProbe(io, info);
@@ -591,20 +813,19 @@ void TestAmdProbeDegradesAndFuses() {
     {   // 能量可用而温度/频率缺失 -> 帧成立,子项各自 NA;
         // APERF/MPERF 补上后 freq = baseGHz * ΔA/ΔM(不除 1000)
         FixtureDriverIo io;
-        io.msr[0xC0010299] = [] { return 14ull << 8; };
-        uint64_t pkg = 0;
-        io.msr[0xC001029B] = [&pkg] { pkg += 32768; return pkg; };
+        io.msrPerCore[{0, 0xC0010299}] = 14ull << 8;
+        io.msrPerCore[{0, 0xC001029B}] = 0;
         pd::PlatformInfo info; info.vendor = pd::Vendor::Amd;
         info.logicalProcessors = 16; info.baseGHz = 3.8;
         auto probe = pd::CreateAmdProbe(io, info);
+        io.msrPerCore[{0, 0xC001029B}] = 32768;   // 2.0 W 保帧
         pd::Sample s;
         Expect(probe->readSample(s), "frame survives missing temp/freq");
         Expect(s.pkgW.valid && !s.tempC.valid && !s.freqGHz.valid,
                "temp/freq degrade to NA independently");
         // ctor 基线期未脚本化(prev=0);本帧 ΔA=1000, ΔM=2000 -> 3.8*0.5
-        uint64_t aperf = 0, mperf = 0;
-        io.msr[0xE8] = [&aperf] { aperf += 1000; return aperf; };
-        io.msr[0xE7] = [&mperf] { mperf += 2000; return mperf; };
+        io.msrPerCore[{0, 0xE8}] = 1000;
+        io.msrPerCore[{0, 0xE7}] = 2000;
         pd::Sample s2;
         Expect(probe->readSample(s2), "second frame reads");
         Expect(s2.freqGHz.valid && std::abs(s2.freqGHz.value - 1.9) < 0.001,
@@ -616,19 +837,18 @@ void TestAmdProbeCoreFailureBlanksDomainAndRebaselines() {
     // 终审修复:逐核 0xC001029A 任一核读取失败 -> coresW 整域 NA(对齐
     // IntelProbe 域语义,不输出残缺和);失败核标记 stale,恢复帧只刷新
     // 基线、跳过一次差分(防止陈旧 prev 造成跨帧累积尖峰)。
+    // v3 fixture:静态表 + msrFailure 钩子推进计数器(读失败但硬件照走)。
     FixtureDriverIo io;
-    io.msr[0xC0010299] = [] { return 14ull << 8; };      // 1/16384 J
-    uint64_t pkg = 0;   // pkg 每帧有效,保证 readSample 帧成立
-    io.msr[0xC001029B] = [&pkg] { pkg += 32768; return pkg; };
-    AmdCoreEnergy coreEnergy(4, 1024);   // 每帧每核 +1024 raw(4/4 无 SMT)
-    io.msr[0xC001029A] = [&coreEnergy] { return coreEnergy(); };
+    io.msrPerCore[{0, 0xC0010299}] = 14ull << 8;   // 1/16384 J
+    io.msrPerCore[{0, 0xC001029B}] = 0;            // pkg 保帧
+    for (unsigned c = 0; c < 4; ++c)
+        io.msrPerCore[{c, 0xC001029A}] = 1024;     // ctor 基线一圈后每核 prev=1024
     // core 1 的第 2 次读取(ctor 基线之后的首帧采样)失败;钩子先推进
-    // 计数器再报失败,模拟真实硬件"读取失败但计数器照常前进"。调用序
-    // 路由保持对齐。
+    // 计数器再报失败,模拟真实硬件"读取失败但计数器照常前进"。
     int core1Reads = 0;
-    io.msrFailure = [&core1Reads, &coreEnergy](unsigned core, uint32_t) {
-        if (core == 1 && ++core1Reads == 2) {
-            coreEnergy();
+    io.msrFailure = [&core1Reads, &io](unsigned core, uint32_t msr) {
+        if (core == 1 && msr == 0xC001029A && ++core1Reads == 2) {
+            io.msrPerCore[{1, 0xC001029A}] += 1024;
             return true;
         }
         return false;
@@ -639,15 +859,21 @@ void TestAmdProbeCoreFailureBlanksDomainAndRebaselines() {
     info.baseGHz = 3.8;
     auto probe = pd::CreateAmdProbe(io, info);
 
-    // 基线:ctor 一圈后每核 prev = 1024。
+    // 基线:ctor 一圈后每核 prev = 1024。帧 1:三核读 2048(各 +1024),
+    // core1 读失败(计数器被钩子推进到 2048)。
+    io.msrPerCore[{0, 0xC001029B}] = 32768;
+    for (unsigned c = 0; c < 4; ++c)
+        if (c != 1) io.msrPerCore[{c, 0xC001029A}] = 2048;
     pd::Sample s1;
     Expect(probe->readSample(s1), "pkg carries the failing frame");
     Expect(!s1.coresW.valid,
            "any per-core read failure blanks the whole cores domain");
 
-    // 恢复帧:core1 只重置基线(跳过差分),其余 3 核各 +1024 ->
+    // 恢复帧:core1 只重置基线(2048,跳过差分),其余 3 核各 +1024 ->
     // sum = 3072 raw;若沿用陈旧 prev,core1 会贡献 2048(两帧累积)
     // -> 5120 raw = 0.3125 W 尖峰。
+    for (unsigned c = 0; c < 4; ++c)
+        if (c != 1) io.msrPerCore[{c, 0xC001029A}] = 3072;
     pd::Sample s2;
     Expect(probe->readSample(s2), "recovery frame reads");
     Expect(s2.coresW.valid, "domain recovers once the failed core reads again");
@@ -655,7 +881,10 @@ void TestAmdProbeCoreFailureBlanksDomainAndRebaselines() {
                std::abs(s2.coresW.value - (3072.0 / 16384.0)) < 0.0001,
            "recovery frame re-baselines the failed core (no spike)");
 
-    // 稳态:4 核全部恢复单帧差分,sum = 4096 raw。
+    // 稳态:4 核全部恢复单帧差分(core1 从 2048 基线到 3072),sum = 4096 raw。
+    for (unsigned c = 0; c < 4; ++c)
+        if (c != 1) io.msrPerCore[{c, 0xC001029A}] = 4096;
+    io.msrPerCore[{1, 0xC001029A}] = 3072;
     pd::Sample s3;
     Expect(probe->readSample(s3), "steady frame reads");
     Expect(s3.coresW.valid &&
@@ -668,16 +897,13 @@ void TestAmdProbeScansPhysicalCoresOnly() {
     // 计数器;遍历全部 nLP 会双计(实测 IA 167% of PKG)。Windows 枚举
     // 同核兄弟为相邻 LP(8C/16T mask 0x0003/0x000C/…,代表集 =
     // {0,2,4,6,8,10,12,14}),探针按 cores 的 repLP 每物理核只读一个代表 LP。
-    // fixture 提供 8 个独立计数器,每物理核每帧 +1024 raw -> 合计
-    // 8*1024 = 8192 raw = 0.5 W;若实现遍历 16 个 LP,fixture 的调用
-    // 路由被拉长一倍,读数翻倍,数值断言立即失败;oddLP 钩子另证
-    // 0xC001029A 从不寻址奇数 LP(SMT 兄弟)。
+    // fixture 只给 8 个代表 LP 表项:若实现遍历 16 个 LP,奇数 LP 无表项
+    // -> 读取失败,断言立即暴露;oddLP 钩子另证 0xC001029A 从不寻址奇数 LP。
     FixtureDriverIo io;
-    io.msr[0xC0010299] = [] { return 14ull << 8; };       // 1/16384 J
-    uint64_t pkg = 0;   // pkg 每帧有效,保证帧成立
-    io.msr[0xC001029B] = [&pkg] { pkg += 32768; return pkg; };
-    AmdCoreEnergy coreEnergy(8, 1024);
-    io.msr[0xC001029A] = [&coreEnergy] { return coreEnergy(); };
+    io.msrPerCore[{0, 0xC0010299}] = 14ull << 8;   // 1/16384 J
+    io.msrPerCore[{0, 0xC001029B}] = 0;            // pkg 保帧
+    const unsigned reps[8] = {0, 2, 4, 6, 8, 10, 12, 14};
+    for (unsigned lp : reps) io.msrPerCore[{lp, 0xC001029A}] = 0;
     bool readOddLp = false;
     io.msrFailure = [&readOddLp](unsigned core, uint32_t msr) {
         if (msr == 0xC001029A && (core & 1)) readOddLp = true;
@@ -688,6 +914,9 @@ void TestAmdProbeScansPhysicalCoresOnly() {
     SetCoreReps(info, {0, 2, 4, 6, 8, 10, 12, 14});
     info.baseGHz = 3.8;
     auto probe = pd::CreateAmdProbe(io, info);
+    io.msrPerCore[{0, 0xC001029B}] = 32768;
+    // 每物理核每帧 +1024 raw -> 合计 8*1024 = 8192 raw = 0.5 W
+    for (unsigned lp : reps) io.msrPerCore[{lp, 0xC001029A}] = 1024;
     pd::Sample s;
     Expect(probe->readSample(s), "smt-dedup sample reads");
     Expect(s.coresW.valid && std::abs(s.coresW.value - 0.5) < 0.0001,
@@ -697,15 +926,16 @@ void TestAmdProbeScansPhysicalCoresOnly() {
     // repLP 越界(> nLP)-> 整表弃用,退回全 LP 遍历(保底不残缺):
     // 16 LP fixture 下 cores 域读满 16 个计数器仍成立。
     FixtureDriverIo io2;
-    io2.msr[0xC0010299] = [] { return 14ull << 8; };
-    uint64_t pkg2 = 0;
-    io2.msr[0xC001029B] = [&pkg2] { pkg2 += 32768; return pkg2; };
-    AmdCoreEnergy coreEnergy2(16, 512);                   // 16*512 = 8192
-    io2.msr[0xC001029A] = [&coreEnergy2] { return coreEnergy2(); };
+    io2.msrPerCore[{0, 0xC0010299}] = 14ull << 8;
+    io2.msrPerCore[{0, 0xC001029B}] = 0;
+    for (unsigned lp = 0; lp < 16; ++lp) io2.msrPerCore[{lp, 0xC001029A}] = 0;
     pd::PlatformInfo info2; info2.vendor = pd::Vendor::Amd;
     info2.logicalProcessors = 16; info2.physicalCores = 8;
     SetCoreReps(info2, {0, 2, 99});                       // 越界条目
     auto probe2 = pd::CreateAmdProbe(io2, info2);
+    io2.msrPerCore[{0, 0xC001029B}] = 32768;
+    // 16 个 LP 各 +512 raw -> 合计 16*512 = 8192 raw = 0.5 W
+    for (unsigned lp = 0; lp < 16; ++lp) io2.msrPerCore[{lp, 0xC001029A}] = 512;
     pd::Sample s2;
     Expect(probe2->readSample(s2), "fallback sample reads");
     Expect(s2.coresW.valid && std::abs(s2.coresW.value - 0.5) < 0.0001,
@@ -723,20 +953,20 @@ void TestAmdProbeTempRangeOffset() {
     //   17h 老式无标志 raw = 640<<21(0x50000000)-> 80.0 C(不加偏移)
     {
         FixtureDriverIo io;
-        io.msr[0xC0010299] = [] { return 14ull << 8; };
-        uint64_t pkg = 0;   // pkg 保帧
-        io.msr[0xC001029B] = [&pkg] { pkg += 32768; return pkg; };
-        io.smn[0x59800] = 0x510B0000u;                    // 实测 idle
+        io.msrPerCore[{0, 0xC0010299}] = 14ull << 8;
+        io.msrPerCore[{0, 0xC001029B}] = 0;   // pkg 保帧
+        io.smn[0x59800] = 0x510B0000u;        // 实测 idle
         pd::PlatformInfo info; info.vendor = pd::Vendor::Amd;
         info.logicalProcessors = 16; info.physicalCores = 8;
         SetCoreReps(info, {0, 2, 4, 6, 8, 10, 12, 14});
         info.family = 0x1A;
         auto probe = pd::CreateAmdProbe(io, info);
+        io.msrPerCore[{0, 0xC001029B}] = 32768;
         pd::Sample s;
         Expect(probe->readSample(s), "idle temp sample reads");
         Expect(s.tempC.valid && std::abs(s.tempC.value - 32.0) < 0.01,
                "RANGE_SEL temp decodes with -49 C (idle 0x510B0000)");
-        io.smn[0x59800] = 0x7D8B0000u;                    // 实测 21 W 载荷
+        io.smn[0x59800] = 0x7D8B0000u;        // 实测 21 W 载荷
         pd::Sample s2;
         Expect(probe->readSample(s2), "load temp sample reads");
         Expect(s2.tempC.valid && std::abs(s2.tempC.value - 76.5) < 0.01,
@@ -745,15 +975,15 @@ void TestAmdProbeTempRangeOffset() {
     {
         // 17h/19h 老式读数:bit19=0 且 TJ_SEL!=11 -> 保持原解码
         FixtureDriverIo io;
-        io.msr[0xC0010299] = [] { return 14ull << 8; };
-        uint64_t pkg = 0;
-        io.msr[0xC001029B] = [&pkg] { pkg += 32768; return pkg; };
-        io.smn[0x59800] = 640u << 21;                     // 80.0 C,无标志位
+        io.msrPerCore[{0, 0xC0010299}] = 14ull << 8;
+        io.msrPerCore[{0, 0xC001029B}] = 0;
+        io.smn[0x59800] = 640u << 21;         // 80.0 C,无标志位
         pd::PlatformInfo info; info.vendor = pd::Vendor::Amd;
         info.logicalProcessors = 16; info.physicalCores = 8;
         SetCoreReps(info, {0, 2, 4, 6, 8, 10, 12, 14});
         info.family = 0x19;
         auto probe = pd::CreateAmdProbe(io, info);
+        io.msrPerCore[{0, 0xC001029B}] = 32768;
         pd::Sample s;
         Expect(probe->readSample(s), "legacy temp sample reads");
         Expect(s.tempC.valid && std::abs(s.tempC.value - 80.0) < 0.01,
@@ -773,10 +1003,9 @@ void TestAmdProbePstateBaseClock() {
     //        42.0x 即 4.2 GHz)
     {
         FixtureDriverIo io;
-        io.msr[0xC0010299] = [] { return 14ull << 8; };
-        uint64_t pkg = 0;   // pkg 保帧
-        io.msr[0xC001029B] = [&pkg] { pkg += 32768; return pkg; };
-        io.msr[0xC0010064] = [] { return 0x334ull; };     // Zen5 P0
+        io.msrPerCore[{0, 0xC0010299}] = 14ull << 8;
+        io.msrPerCore[{0, 0xC001029B}] = 0;   // pkg 保帧
+        io.msrPerCore[{0, 0xC0010064}] = 0x334ull;         // Zen5 P0
         pd::PlatformInfo info; info.vendor = pd::Vendor::Amd;
         info.logicalProcessors = 16; info.physicalCores = 8;
         SetCoreReps(info, {0, 2, 4, 6, 8, 10, 12, 14});
@@ -786,9 +1015,9 @@ void TestAmdProbePstateBaseClock() {
                "zen5 base = CpuFid[11:0] * 5 MHz");
         // ctor 基线期 APERF/MPERF 未脚本化(prev=0);本帧 ΔA=1000,
         // ΔM=2000 -> 比值 0.5 -> 4.1 * 0.5 = 2.05 GHz
-        uint64_t aperf = 0, mperf = 0;
-        io.msr[0xE8] = [&aperf] { aperf += 1000; return aperf; };
-        io.msr[0xE7] = [&mperf] { mperf += 2000; return mperf; };
+        io.msrPerCore[{0, 0xC001029B}] = 32768;
+        io.msrPerCore[{0, 0xE8}] = 1000;
+        io.msrPerCore[{0, 0xE7}] = 2000;
         pd::Sample s;
         Expect(probe->readSample(s), "zen5 freq sample reads");
         Expect(s.freqGHz.valid && std::abs(s.freqGHz.value - 2.05) < 0.001,
@@ -796,10 +1025,9 @@ void TestAmdProbePstateBaseClock() {
     }
     {
         FixtureDriverIo io;
-        io.msr[0xC0010299] = [] { return 14ull << 8; };
-        uint64_t pkg = 0;
-        io.msr[0xC001029B] = [&pkg] { pkg += 32768; return pkg; };
-        io.msr[0xC0010064] = [] { return (8ull << 8) | 0xA8ull; };  // 168/8
+        io.msrPerCore[{0, 0xC0010299}] = 14ull << 8;
+        io.msrPerCore[{0, 0xC001029B}] = 0;
+        io.msrPerCore[{0, 0xC0010064}] = (8ull << 8) | 0xA8ull;  // 168/8
         pd::PlatformInfo info; info.vendor = pd::Vendor::Amd;
         info.logicalProcessors = 8; info.physicalCores = 4;
         SetCoreReps(info, {0, 2, 4, 6});
@@ -810,14 +1038,14 @@ void TestAmdProbePstateBaseClock() {
         // 无 P-state(family 0x19 未脚本化 0xC0010064)时保持入口层
         // baseGHz(0),频率 NA —— 诚实降级
         FixtureDriverIo io2;
-        io2.msr[0xC0010299] = [] { return 14ull << 8; };
-        uint64_t pkg2 = 0;
-        io2.msr[0xC001029B] = [&pkg2] { pkg2 += 32768; return pkg2; };
+        io2.msrPerCore[{0, 0xC0010299}] = 14ull << 8;
+        io2.msrPerCore[{0, 0xC001029B}] = 0;
         pd::PlatformInfo info2; info2.vendor = pd::Vendor::Amd;
         info2.logicalProcessors = 8; info2.physicalCores = 4;
         SetCoreReps(info2, {0, 2, 4, 6});
         info2.family = 0x19; info2.baseGHz = 0.0;
         auto probe2 = pd::CreateAmdProbe(io2, info2);
+        io2.msrPerCore[{0, 0xC001029B}] = 32768;
         pd::Sample s2;
         Expect(probe2->readSample(s2), "no-pstate frame reads");
         Expect(!s2.freqGHz.valid, "missing P-state leaves freq NA");
@@ -1033,6 +1261,7 @@ int main() {
     TestDriverIoFixtureRouting();
     TestIntelProbeReplay();
     TestIntelProbeEnergyWraparound();
+    TestIntelProbeWideTable();
     TestAmdProbeReplay();
     TestAmdProbeEnergyWraparound();
     TestAmdProbeDegradesAndFuses();

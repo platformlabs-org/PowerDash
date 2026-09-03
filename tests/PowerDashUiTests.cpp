@@ -15,6 +15,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -409,8 +410,8 @@ public:
 
 // Task 3 适配:PlatformInfo::coreLPs(代表 LP 列表)→ cores(CoreInfo)。
 // 旧测试以代表 LP 列表描述拓扑;helper 逐 repLP 合成单线程 CoreInfo
-// (现存探针只消费 repLP;SMT 兄弟表 threads 仅在真机拓扑里由
-// QueryCoreTopologyV2 填充,Task 4/5 重写探针时再按需扩展)。
+// (Task 4/5 后 Intel/AMD 探针均消费完整 CoreInfo —— 本 helper 的单线程
+// 合成即"SMT 不可见"的保底拓扑,repLP=唯一线程)。
 void SetCoreReps(pd::PlatformInfo& info, std::initializer_list<unsigned> reps) {
     info.cores.clear();
     for (unsigned lp : reps)
@@ -785,8 +786,9 @@ void TestAmdProbeReplay() {
     Expect(!s.gfxW.valid && !s.platformW.valid, "absent domains stay invalid");
     Expect(s.tempC.valid && std::abs(s.tempC.value - 80.0) < 0.01,
            "SMN Tctl decode");
-    // APERF/MPERF 未脚本化 -> 频率 NA(子项优雅降级)
-    Expect(!s.freqGHz.valid, "APERF/MPERF unscripted leaves freq invalid");
+    // 0xC0010293 未脚本化 -> 无时钟列 -> 频率 NA(freq = clock.avg/1000,
+    // 子项优雅降级)
+    Expect(!s.freqGHz.valid, "COFVID unscripted leaves freq invalid");
 }
 
 void TestAmdProbeEnergyWraparound() {
@@ -838,7 +840,7 @@ void TestAmdProbeDegradesAndFuses() {
         Expect(!s.pkgW.valid && !s.coresW.valid, "energy fields stay invalid");
     }
     {   // 能量可用而温度/频率缺失 -> 帧成立,子项各自 NA;
-        // APERF/MPERF 补上后 freq = baseGHz * ΔA/ΔM(不除 1000)
+        // COFVID(0xC0010293)补上后 freq = clock.avg/1000
         FixtureDriverIo io;
         io.msrPerCore[{0, 0xC0010299}] = 14ull << 8;
         io.msrPerCore[{0, 0xC001029B}] = 0;
@@ -850,13 +852,28 @@ void TestAmdProbeDegradesAndFuses() {
         Expect(probe->readSample(s), "frame survives missing temp/freq");
         Expect(s.pkgW.valid && !s.tempC.valid && !s.freqGHz.valid,
                "temp/freq degrade to NA independently");
-        // ctor 基线期未脚本化(prev=0);本帧 ΔA=1000, ΔM=2000 -> 3.8*0.5
-        io.msrPerCore[{0, 0xE8}] = 1000;
-        io.msrPerCore[{0, 0xE7}] = 2000;
+    }
+    {   // v3:freq 派生改 clock.avg/1000;ΔA<ΔM 时钟按 LHM 节流调整 ×ΔA/ΔM
+        // —— COFVID fid=0x2BC(700)→3500 MHz,RO 别名 A/M 基线 0、本帧
+        // ΔA=1000/ΔM=2000 -> 3500*0.5/1000 = 1.75 GHz
+        FixtureDriverIo io;
+        io.msrPerCore[{0, 0xC0010299}] = 14ull << 8;
+        io.msrPerCore[{0, 0xC001029B}] = 0;
+        io.msrPerCore[{0, 0xC0010293}] = (80ull << 14) | 0x2BCull;
+        io.msrPerCore[{0, 0xC00000E8}] = 0;   // RO APERF 基线
+        io.msrPerCore[{0, 0xC00000E7}] = 0;   // RO MPERF 基线
+        pd::PlatformInfo info; info.vendor = pd::Vendor::Amd;
+        info.logicalProcessors = 16; info.family = 0x1A;
+        auto probe = pd::CreateAmdProbe(io, info);
+        io.msrPerCore[{0, 0xC001029B}] = 32768;   // 2.0 W 保帧
+        pd::Sample s;
+        Expect(probe->readSample(s), "first frame anchors the A/M baseline");
+        io.msrPerCore[{0, 0xC00000E8}] = 1000;    // ΔA=1000
+        io.msrPerCore[{0, 0xC00000E7}] = 2000;    // ΔM=2000
         pd::Sample s2;
         Expect(probe->readSample(s2), "second frame reads");
-        Expect(s2.freqGHz.valid && std::abs(s2.freqGHz.value - 1.9) < 0.001,
-               "freq = baseGHz * aperf/mperf ratio (3.8 * 0.5)");
+        Expect(s2.freqGHz.valid && std::abs(s2.freqGHz.value - 1.75) < 0.001,
+               "freq = (fid*5 x dA/dM)/1000 (3500 * 0.5 / 1000)");
     }
 }
 
@@ -885,6 +902,7 @@ void TestAmdProbeCoreFailureBlanksDomainAndRebaselines() {
     SetCoreReps(info, {0, 1, 2, 3});
     info.baseGHz = 3.8;
     auto probe = pd::CreateAmdProbe(io, info);
+    pd::SensorTable& tb = *probe->sensors();
 
     // 基线:ctor 一圈后每核 prev = 1024。帧 1:三核读 2048(各 +1024),
     // core1 读失败(计数器被钩子推进到 2048)。
@@ -895,6 +913,9 @@ void TestAmdProbeCoreFailureBlanksDomainAndRebaselines() {
     Expect(probe->readSample(s1), "pkg carries the failing frame");
     Expect(!s1.coresW.valid,
            "any per-core read failure blanks the whole cores domain");
+    // v3 宽表:整域 NA 覆盖每核功率列 + (avg)(不输出残缺值)
+    Expect(!tb.Lookup("power.core.avg").valid && !tb.Lookup("power.core.0").valid,
+           "per-core power columns blank with the failing domain");
 
     // 恢复帧:core1 只重置基线(2048,跳过差分),其余 3 核各 +1024 ->
     // sum = 3072 raw;若沿用陈旧 prev,core1 会贡献 2048(两帧累积)
@@ -907,6 +928,14 @@ void TestAmdProbeCoreFailureBlanksDomainAndRebaselines() {
     Expect(s2.coresW.valid &&
                std::abs(s2.coresW.value - (3072.0 / 16384.0)) < 0.0001,
            "recovery frame re-baselines the failed core (no spike)");
+    Expect(tb.Lookup("power.core.0").valid &&
+               std::abs(tb.Lookup("power.core.0").value - (1024.0 / 16384.0)) < 1e-9,
+           "healthy cores publish their deltas on the recovery frame");
+    Expect(!tb.Lookup("power.core.1").valid,
+           "recovered core skips one diff (column NA this frame)");
+    Expect(tb.Lookup("power.core.avg").valid &&
+               std::abs(tb.Lookup("power.core.avg").value - (1024.0 / 16384.0)) < 1e-9,
+           "power.core.avg = mean over the cores that diffed");
 
     // 稳态:4 核全部恢复单帧差分(core1 从 2048 基线到 3072),sum = 4096 raw。
     for (unsigned c = 0; c < 4; ++c)
@@ -1033,6 +1062,7 @@ void TestAmdProbePstateBaseClock() {
         io.msrPerCore[{0, 0xC0010299}] = 14ull << 8;
         io.msrPerCore[{0, 0xC001029B}] = 0;   // pkg 保帧
         io.msrPerCore[{0, 0xC0010064}] = 0x334ull;         // Zen5 P0
+        io.msrPerCore[{0, 0xC0010293}] = 0x334ull;         // COFVID fid 820
         pd::PlatformInfo info; info.vendor = pd::Vendor::Amd;
         info.logicalProcessors = 16; info.physicalCores = 8;
         SetCoreReps(info, {0, 2, 4, 6, 8, 10, 12, 14});
@@ -1040,15 +1070,13 @@ void TestAmdProbePstateBaseClock() {
         auto probe = pd::CreateAmdProbe(io, info);
         Expect(std::abs(probe->caps().baseGHz - 4.1) < 0.001,
                "zen5 base = CpuFid[11:0] * 5 MHz");
-        // ctor 基线期 APERF/MPERF 未脚本化(prev=0);本帧 ΔA=1000,
-        // ΔM=2000 -> 比值 0.5 -> 4.1 * 0.5 = 2.05 GHz
+        // v3:freq = clock.avg/1000(clock.N = fid×5);A/M 未脚本化 ->
+        // 无 ΔA/ΔM 节流调整,clock.0 = 820*5 = 4100 MHz
         io.msrPerCore[{0, 0xC001029B}] = 32768;
-        io.msrPerCore[{0, 0xE8}] = 1000;
-        io.msrPerCore[{0, 0xE7}] = 2000;
         pd::Sample s;
         Expect(probe->readSample(s), "zen5 freq sample reads");
-        Expect(s.freqGHz.valid && std::abs(s.freqGHz.value - 2.05) < 0.001,
-               "zen5 freq = P0 base * aperf/mperf ratio");
+        Expect(s.freqGHz.valid && std::abs(s.freqGHz.value - 4.1) < 0.001,
+               "zen5 freq = COFVID fid x 5 / 1000");
     }
     {
         FixtureDriverIo io;
@@ -1062,21 +1090,299 @@ void TestAmdProbePstateBaseClock() {
         auto probe = pd::CreateAmdProbe(io, info);
         Expect(std::abs(probe->caps().baseGHz - 4.2) < 0.001,
                "zen4 base = CpuFid / CpuDfsId * 200 MHz");
-        // 无 P-state(family 0x19 未脚本化 0xC0010064)时保持入口层
-        // baseGHz(0),频率 NA —— 诚实降级
+        // v3:P-state 缺席只废 bus/比率列;时钟列(fid 解码)不依赖 bus ->
+        // COFVID fid=0x28/dfsId=8 -> 40/8*200 = 1000 MHz,freq 照常出
         FixtureDriverIo io2;
         io2.msrPerCore[{0, 0xC0010299}] = 14ull << 8;
         io2.msrPerCore[{0, 0xC001029B}] = 0;
+        io2.msrPerCore[{0, 0xC0010293}] = (8ull << 8) | 0x28ull;  // 40/8
         pd::PlatformInfo info2; info2.vendor = pd::Vendor::Amd;
         info2.logicalProcessors = 8; info2.physicalCores = 4;
         SetCoreReps(info2, {0, 2, 4, 6});
         info2.family = 0x19; info2.baseGHz = 0.0;
         auto probe2 = pd::CreateAmdProbe(io2, info2);
+        pd::SensorTable* t2 = probe2->sensors();
+        Expect(t2 != nullptr, "amd probe exposes its wide table");
         io2.msrPerCore[{0, 0xC001029B}] = 32768;
         pd::Sample s2;
         Expect(probe2->readSample(s2), "no-pstate frame reads");
-        Expect(!s2.freqGHz.valid, "missing P-state leaves freq NA");
+        Expect(t2->Lookup("clock.0").valid &&
+                   std::abs(t2->Lookup("clock.0").value - 1000.0) < 1e-9,
+               "older family clock = fid / dfsId x 200");
+        Expect(!t2->Lookup("clock.bus").valid, "missing P0 leaves bus NA");
+        Expect(t2->Find("ratio.0") >= 0 && !t2->Lookup("ratio.0").valid,
+               "ratio column present but NA without bus");
+        Expect(s2.freqGHz.valid && std::abs(s2.freqGHz.value - 1.0) < 0.001,
+               "clock survives missing P0 (no bus dependency)");
     }
+}
+
+// ---- Task 5: AmdProbe MSR 宽表(经 IPlatformProbe 接口消费,不向下转型)----
+void TestAmdProbeWideTable() {
+    // Zen5(fid×5)+Zen5c 混合拓扑 2C/4T;能量 bits=16(1/65536 J)。
+    // 规约值(plan ruling):P0 fid=700 -> 3500 MHz;0xC0010293 fid=700
+    // (0x2BC)-> 3500 MHz、VID[21:14]=80 -> 1.05 V;Tctl 0x510B0000 ->
+    // 32.0 C;EPP 128 -> 128/2.55 = 50.196...%。
+    FixtureDriverIo io;
+    io.msrPerCore[{0, 0xC0010299}] = 16ull << 8;             // energy bits 16
+    io.msrPerCore[{0, 0xC0010293}] = (80ull << 14) | 0x2BCull;  // 3500/1.05
+    io.msrPerCore[{2, 0xC0010293}] = (64ull << 14) | 0x258ull;  // 3000/1.15
+    io.msrPerCore[{0, 0xC0010064}] = 0x2BC;                  // P0 -> 3500 MHz
+    io.msrPerCore[{0, 0xC001029B}] = 0;                      // pkg/每核能量基线 0
+    io.msrPerCore[{0, 0xC001029A}] = 0;
+    io.msrPerCore[{2, 0xC001029A}] = 0;
+    io.msrPerCore[{0, 0xC00102B3}] = 128ull << 24;           // EPP 128
+    io.msrPerCore[{2, 0xC00102B3}] = 128ull << 24;
+    io.smn[0x59800] = 0x510B0000u;                           // k10temp -> 32.0 C
+    for (unsigned lp = 0; lp < 4; ++lp) {                    // RO 别名基线 0
+        io.msrPerCore[{lp, 0xC00000E8}] = 0;
+        io.msrPerCore[{lp, 0xC00000E7}] = 0;
+    }
+    pd::PlatformInfo info;
+    info.vendor = pd::Vendor::Amd;
+    // nLP 取真机值:NtUsageSource 按条目数精确校验返回长度,只有与系统
+    // LP 数一致时 usage 才能出值(暖机后断言依赖它)。
+    info.logicalProcessors = std::thread::hardware_concurrency();
+    info.family = 0x1A;
+    info.cores = { {0, {0, 1}, 0}, {2, {2, 3}, 1} };   // Zen5(2T) + Zen5c(2T)
+    const double tscHz = pd::CalibrateTscHz();   // 独立测 TSC,断言 bus 公式
+    auto probe = pd::CreateAmdProbe(io, info);
+    pd::SensorTable* t = probe->sensors();
+    Expect(t != nullptr, "amd probe exposes its wide table");
+    Expect(std::abs(probe->caps().baseGHz - 3.5) < 1e-9,
+           "caps base = P0 fid 700 x 5 / 1000");
+
+    // 列名 = amd.CSV 原文(核名 family 0x1A:Zen5/Zen5c + repLP 编号;
+    // 功率列 = 纯 "Core %u Power" 核序号 —— amd.CSV 即如此)
+    int i = -1;
+    Expect((i = t->Find("vid.0")) >= 0 &&
+               t->Column(i).name == "Zen5 Core 0 VID [V]",
+           "core 0 uses Zen5 naming");
+    Expect((i = t->Find("clock.1")) >= 0 &&
+               t->Column(i).name == "Zen5c Core 2 Clock [MHz]",
+           "core 1 uses Zen5c naming numbered by repLP");
+    Expect((i = t->Find("eff.1.1")) >= 0 &&
+               t->Column(i).name == "Zen5c Core 2 T1 Effective Clock [MHz]",
+           "per-thread effective clock uses HWiNFO T0/T1 naming");
+    Expect((i = t->Find("usage.0.1")) >= 0 &&
+               t->Column(i).name == "Zen5 Core 0 T1 Usage [%]",
+           "per-thread usage column name");
+    Expect((i = t->Find("util.1.0")) >= 0 &&
+               t->Column(i).name == "Zen5c Core 2 T0 Utility [%]",
+           "per-thread utility column name");
+    Expect((i = t->Find("cores.c0.1")) >= 0 &&
+               t->Column(i).name == "Zen5c Core 2 C0 Residency [%]",
+           "per-core C0 residency column name");
+    Expect((i = t->Find("temp.tctl")) >= 0 &&
+               t->Column(i).name == "CPU (Tctl/Tdie) [°C]",
+           "tctl column name");
+    Expect((i = t->Find("power.core.1")) >= 0 &&
+               t->Column(i).name == "Core 1 Power [W]",
+           "per-core power uses plain core-index naming");
+    Expect((i = t->Find("power.core.avg")) >= 0 &&
+               t->Column(i).name == "Core Powers (avg) [W]",
+           "core powers avg column name");
+    Expect((i = t->Find("epp.avg")) >= 0 &&
+               t->Column(i).name == "Energy Performance Preference [%]",
+           "single global EPP column");
+    // 组序:VID->时钟->有效->Usage->Utility->Ratio->C0->温度->功率->EPP
+    Expect(t->Find("vid.avg") < t->Find("clock.avg") &&
+               t->Find("clock.avg") < t->Find("eff.avg") &&
+               t->Find("eff.avg") < t->Find("usage.avg") &&
+               t->Find("usage.avg") < t->Find("util.avg") &&
+               t->Find("util.avg") < t->Find("ratio.avg") &&
+               t->Find("ratio.avg") < t->Find("cores.c0.avg") &&
+               t->Find("cores.c0.avg") < t->Find("temp.tctl") &&
+               t->Find("temp.tctl") < t->Find("power.pkg") &&
+               t->Find("power.pkg") < t->Find("epp.avg"),
+           "column groups follow the amd.CSV order");
+
+    // 两拍:ctor 基线 -> bump -> readSample(能量差分每拍 1.0/0.5 W)
+    auto bump = [&io] {
+        io.msrPerCore[{0, 0xC001029B}] += 65536;
+        io.msrPerCore[{0, 0xC001029A}] += 32768;
+        io.msrPerCore[{2, 0xC001029A}] += 32768;
+    };
+    bump();
+    pd::Sample s1;
+    Expect(probe->readSample(s1), "beat 1 reads");
+    pd::SensorTable& tb = *t;
+
+    // VID = 1.550 - 0.00625 x vid[21:14](80 -> 1.05、64 -> 1.15)
+    Expect(tb.Lookup("vid.0").valid &&
+               std::abs(tb.Lookup("vid.0").value - 1.05) < 1e-9,
+           "vid.0 = 1.55 - 0.00625*80");
+    Expect(tb.Lookup("vid.1").valid &&
+               std::abs(tb.Lookup("vid.1").value - 1.15) < 1e-9,
+           "vid.1 = 1.55 - 0.00625*64");
+    Expect(tb.Lookup("vid.avg").valid &&
+               std::abs(tb.Lookup("vid.avg").value - 1.10) < 1e-9,
+           "vid.avg = mean over readable cores");
+    // 时钟 = fid x 5(family 0x1A);bus = 实测 TSC / (P0MHz/100);ratio = clock/bus
+    const pd::Reading bus = tb.Lookup("clock.bus");
+    const double busExp = tscHz / (3500.0 / 100.0) / 1e6;
+    Expect(bus.valid && std::abs(bus.value - busExp) < 0.02 * busExp,
+           "bus = CalibrateTscHz()/(P0MHz/100)");
+    Expect(bus.value > 50.0 && bus.value < 200.0,
+           "bus in BCLK band (unit regression)");
+    Expect(tb.Lookup("clock.0").valid &&
+               std::abs(tb.Lookup("clock.0").value - 3500.0) < 1e-9,
+           "clock.0 = fid 700 x 5");
+    Expect(tb.Lookup("clock.1").valid &&
+               std::abs(tb.Lookup("clock.1").value - 3000.0) < 1e-9,
+           "clock.1 = fid 600 x 5");
+    Expect(tb.Lookup("clock.avg").valid &&
+               std::abs(tb.Lookup("clock.avg").value - 3250.0) < 1e-9,
+           "clock.avg = mean over readable cores");
+    Expect(tb.Lookup("ratio.0").valid &&
+               std::abs(tb.Lookup("ratio.0").value - 3500.0 / bus.value) < 1e-9,
+           "ratio.0 = clock/bus");
+    Expect(tb.Lookup("ratio.avg").valid &&
+               std::abs(tb.Lookup("ratio.avg").value -
+                        3250.0 / bus.value) < 1e-9,
+           "ratio.avg = mean clock / bus");
+    // 温度/EPP/功率规约值
+    Expect(tb.Lookup("temp.tctl").valid &&
+               std::abs(tb.Lookup("temp.tctl").value - 32.0) < 1e-9,
+           "temp.tctl = (0x510B0000>>21)*0.125 - 49");
+    const double eppExp = 128.0 / 2.55;
+    Expect(tb.Lookup("epp.avg").valid &&
+               std::abs(tb.Lookup("epp.avg").value - eppExp) < 1e-6 * eppExp,
+           "epp.avg = 128/2.55 (mean over readable cores)");
+    Expect(tb.Lookup("power.pkg").valid &&
+               std::abs(tb.Lookup("power.pkg").value - 1.0) < 1e-6,
+           "power.pkg = 65536 raw x 1/65536 J");
+    Expect(tb.Lookup("power.core.0").valid &&
+               std::abs(tb.Lookup("power.core.0").value - 0.5) < 1e-6,
+           "power.core.0 = 32768 raw x 1/65536 J");
+    Expect(tb.Lookup("power.core.avg").valid &&
+               std::abs(tb.Lookup("power.core.avg").value - 0.5) < 1e-6,
+           "power.core.avg = mean of per-core powers");
+    // A/M 恒 0 差:eff/C0 有效 0;dM=0 -> utility NA(频率加权比不可算)
+    for (const char* k : {"eff.0.0", "eff.1.1", "eff.all", "cores.c0.0",
+                          "cores.c0.avg"})
+        Expect(tb.Lookup(k).valid && tb.Lookup(k).value == 0.0,
+               "zero APERF/MPERF delta keeps eff/C0 valid at 0");
+    Expect(!tb.Lookup("util.0.0").valid, "utility NA while dMPERF is 0");
+    // Usage:真源双基线暖机,前两拍 NA(暖机期不猜值)
+    Expect(!tb.Lookup("usage.total").valid && !tb.Lookup("usage.avg").valid,
+           "usage NA during warm-up frames");
+    // Sample 派生:同键单条写路径(表值 == Sample 值)
+    Expect(s1.pkgW.valid &&
+               std::abs(s1.pkgW.value - tb.Lookup("power.pkg").value) < 1e-12,
+           "Sample pkgW == power.pkg");
+    Expect(s1.coresW.valid && std::abs(s1.coresW.value - 1.0) < 1e-6,
+           "Sample coresW = sum of per-core power columns");
+    Expect(s1.tempC.valid && std::abs(s1.tempC.value - 32.0) < 1e-9,
+           "Sample tempC == temp.tctl");
+    Expect(s1.freqGHz.valid && std::abs(s1.freqGHz.value - 3.25) < 1e-9,
+           "Sample freq = clock.avg/1000");
+    Expect(!s1.utilPct.valid, "utilPct NA while usage warms up");
+    Expect(!s1.gfxW.valid && !s1.platformW.valid &&
+               !s1.powerLimit.sustainedW.valid && !s1.currentLimit.tdcA.valid,
+           "unsupported domains stay NA (limits await Task 6)");
+
+    // 拍 2:LHM 节流调整 —— dA/dM = 1000/2000 = 0.5(<1)-> clock x 0.5;
+    // usage 暖机第 2 拍仍 NA
+    for (unsigned lp = 0; lp < 4; ++lp) {
+        io.msrPerCore[{lp, 0xC00000E8}] = 1000;
+        io.msrPerCore[{lp, 0xC00000E7}] = 2000;
+    }
+    bump();
+    pd::Sample s2;
+    Expect(probe->readSample(s2), "beat 2 reads");
+    Expect(tb.Lookup("clock.0").valid &&
+               std::abs(tb.Lookup("clock.0").value - 1750.0) < 1e-9,
+           "throttled clock.0 = 3500 x dA/dM (LHM)");
+    Expect(tb.Lookup("clock.1").valid &&
+               std::abs(tb.Lookup("clock.1").value - 1500.0) < 1e-9,
+           "throttled clock.1 = 3000 x dA/dM");
+    Expect(!tb.Lookup("usage.total").valid, "usage still warming up on beat 2");
+
+    // 拍 3:usage 出值;utility = busy x clamp(dA/dM, 0..4) 钳 0-100
+    // (dA=8000/dM=1000 -> 比 8 钳 4;dA>dM -> 时钟无节流回满值)
+    for (unsigned lp = 0; lp < 4; ++lp) {
+        io.msrPerCore[{lp, 0xC00000E8}] += 8000;
+        io.msrPerCore[{lp, 0xC00000E7}] += 1000;
+    }
+    bump();
+    pd::Sample s3;
+    Expect(probe->readSample(s3), "beat 3 reads");
+    Expect(tb.Lookup("usage.total").valid && tb.Lookup("usage.avg").valid,
+           "usage valid after two warm-up frames");
+    Expect(tb.Lookup("usage.0.0").valid, "per-thread usage valid");
+    // util.0.0 = min(busy x 4, 100)(busy = 本帧 usage.0.0,同帧同源)
+    const double b00 = tb.Lookup("usage.0.0").value;
+    double utilExp = b00 * 4.0;
+    if (utilExp > 100.0) utilExp = 100.0;
+    Expect(tb.Lookup("util.0.0").valid &&
+               std::abs(tb.Lookup("util.0.0").value - utilExp) < 1e-9,
+           "utility = usage x clamp(dA/dM=8 -> 4), clamped 0-100");
+    Expect(tb.Lookup("clock.0").valid &&
+               std::abs(tb.Lookup("clock.0").value - 3500.0) < 1e-9,
+           "dA/dM > 1 leaves the clock unadjusted");
+    Expect(s3.utilPct.valid && s3.utilPct.value == tb.Lookup("usage.total").value,
+           "Sample utilPct == usage.total");
+
+    // 拍 4/5:有效时钟单位回归 —— 测试侧 __rdtsc 忙等 ~10 ms 实测窗口;
+    // eff = dA x tscHz/ΔTSC/1e6(MHz 公式 ±10% + 合理带双保险),
+    // C0 = dM/ΔTSC x 100(同窗)。
+    pd::Sample s4;
+    Expect(probe->readSample(s4), "beat 4 re-anchors APERF/MPERF baseline");
+    const unsigned long long w1 = __rdtsc();
+    while (__rdtsc() - w1 < tscHz / 100) {}   // ~10 ms 忙等(窗口主体)
+    for (unsigned lp = 0; lp < 4; ++lp) {
+        io.msrPerCore[{lp, 0xC00000E8}] += 20000000ull;   // dA = 2e7
+        io.msrPerCore[{lp, 0xC00000E7}] += 10000000ull;   // dM = 1e7(C0 同窗)
+    }
+    const unsigned long long w2 = __rdtsc();
+    pd::Sample s5;
+    Expect(probe->readSample(s5), "beat 5 reads the advanced APERF");
+    const double windowTicks = (double)(w2 - w1);
+    const double effExp = 20000000.0 * tscHz / windowTicks / 1e6;
+    for (const char* k : {"eff.0.0", "eff.all"}) {
+        const pd::Reading eff = tb.Lookup(k);
+        Expect(eff.valid, "effective clock decodes with advanced APERF");
+        Expect(eff.valid && eff.value > 0.0 && eff.value < 20000.0,
+               "effective clock in sane MHz band (unit regression)");
+        Expect(eff.valid && std::abs(eff.value - effExp) < 0.10 * effExp,
+               "effective clock = dAPERF*tscHz/dTSC/1e6 (MHz formula)");
+    }
+    const double c0Exp = 10000000.0 / windowTicks * 100.0;
+    const pd::Reading c0 = tb.Lookup("cores.c0.0");
+    Expect(c0.valid && std::abs(c0.value - c0Exp) < 0.10 * c0Exp,
+           "cores.c0.0 = dMPERF/dTSC x 100");
+
+    // 拍 6:抽走 Zen5 COFVID/EPP -> 时钟/VID 列回 NA、均值只聚合 Zen5c,
+    // EPP 只聚合 Zen5c(51/2.55=20.0,区别于双核均值);能量照常帧仍成立
+    io.msrPerCore.erase({0, 0xC0010293});
+    io.msrPerCore.erase({0, 0xC00102B3});
+    io.msrPerCore[{2, 0xC00102B3}] = 51ull << 24;
+    bump();
+    pd::Sample s6;
+    Expect(probe->readSample(s6), "beat 6 reads");
+    Expect(!tb.Lookup("clock.0").valid && !tb.Lookup("vid.0").valid,
+           "failed COFVID read leaves NA (no stale value)");
+    Expect(tb.Lookup("clock.avg").valid &&
+               std::abs(tb.Lookup("clock.avg").value - 3000.0) < 1e-9,
+           "clock.avg aggregates the readable core only");
+    Expect(tb.Lookup("epp.avg").valid &&
+               std::abs(tb.Lookup("epp.avg").value - 20.0) < 1e-9,
+           "epp.avg aggregates the readable core only (51/2.55)");
+    Expect(tb.Lookup("power.pkg").valid &&
+               std::abs(tb.Lookup("power.pkg").value - 1.0) < 1e-6,
+           "healthy columns keep decoding on the degraded frame");
+    Expect(s6.freqGHz.valid && std::abs(s6.freqGHz.value - 3.0) < 1e-9,
+           "Sample freq follows the surviving clock.avg");
+
+    // 拍 7:EPP 全抽走 -> NA;功率域全断 -> 熔断 false(全部功率域失败)
+    io.msrPerCore.erase({2, 0xC00102B3});
+    io.msrPerCore.erase({0, 0xC001029B});
+    io.msrPerCore.erase({0, 0xC001029A});
+    io.msrPerCore.erase({2, 0xC001029A});
+    pd::Sample s7;
+    Expect(!probe->readSample(s7), "all power domains absent fails the frame");
+    Expect(!tb.Lookup("epp.avg").valid, "epp NA when no core is readable");
 }
 
 void TestSamplerDrivesSinkAndFillsPlatformIndependentFields() {
@@ -1296,6 +1602,7 @@ int main() {
     TestAmdProbeScansPhysicalCoresOnly();
     TestAmdProbeTempRangeOffset();
     TestAmdProbePstateBaseClock();
+    TestAmdProbeWideTable();
     TestSamplerDrivesSinkAndFillsPlatformIndependentFields();
     TestSamplerExitsAfterFiveConsecutiveFailures();
     TestUsageMonitorDiff();

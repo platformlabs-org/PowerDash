@@ -10,9 +10,22 @@
 
 namespace pd {
 
+// Task 10:TryCreate 逐步诊断结果(--pmdump 握手失败时的取证输出)。
+// failedStep 与 TryCreate 各步一一对应;字段保留到首败步为止(其后为 0)。
+struct SmuHandshakeTrace {   // TryCreate 各步结果(--pmdump 诊断输出)
+    int failedStep = 0;      // 0=全成;1=写自检失败;2=回读不符;3=测试消息;
+                            // 4=版本消息;5=地址消息;6=地址为0;7=映射失败;
+                            // 8=首次 transfer
+    uint32_t argReadback = 0;     // step2 实际回读值
+    uint32_t testRep = 0, versionRep = 0, addrRep = 0, transferRep = 0;
+    uint32_t version = 0;
+    uint64_t addr = 0;
+};
+
 class SmuPmTable {
 public:
     static std::unique_ptr<SmuPmTable> TryCreate(DriverIo& io);  // 失败 nullptr(诚实降级)
+    static SmuHandshakeTrace Diagnose(DriverIo& io);   // 逐步执行,不构造对象、不映射(到 step7 为止的只读诊断 + step8 transfer)
     ~SmuPmTable();                        // UnmapPhys 映射窗口
     bool Refresh();                       // 每帧:transfer 0x65(拒绝→10ms 重试一次)
     float At(uint32_t byteOff) const;     // float@偏移;越界/未刷新 NAN

@@ -135,4 +135,42 @@ std::unique_ptr<SmuPmTable> SmuPmTable::TryCreate(DriverIo& io) {
     return t;
 }
 
+/* Task 10:握手逐步诊断(--pmdump TryCreate 失败后的取证)。与 TryCreate
+ * 同一序列逐步执行,记录每步中间量(响应码/回读/版本/地址),首败即停
+ * (其后字段保持 0)。与 TryCreate 的两点刻意差异:step7 不做映射(诊断
+ * 不占用/泄漏映射窗口;failedStep=7 保留枚举语义但本函数不会产生),
+ * step8 只发一条 0x65 记录响应码(不走 Refresh 的 0x80 重试)。内部临时
+ * 实例仅为复用私有 SmuMsg(map_ 恒空,析构无副作用),不产出对象状态。
+ * Krackan 实机:TryCreate 报 handshake failed 而邮箱终态 msg=0x65/rep=0x1,
+ * 本函数给出精确失败步与固件版本应答。 */
+SmuHandshakeTrace SmuPmTable::Diagnose(DriverIo& io) {
+    SmuHandshakeTrace tr;
+    SmuPmTable tmp(io);                    // 无状态临时实例:仅借 SmuMsg
+    // (a1) 写自检魔数:写不进 = SMN 窗/驱动拒绝。
+    if (!io.WriteSmn(kArgs, kArgSelftest)) { tr.failedStep = 1; return tr; }
+    // (a2) 回读自检:记下实际值(不符 = 窗不可写/被覆盖)。
+    uint32_t readback = 0;
+    if (!io.ReadSmn(kArgs, readback)) { tr.failedStep = 2; return tr; }
+    tr.argReadback = readback;
+    if (readback != kArgSelftest) { tr.failedStep = 2; return tr; }
+    // (b) 测试消息。
+    uint32_t args[kArgCount] = {};
+    tr.testRep = tmp.SmuMsg(kMsgTest, args);
+    if (tr.testRep != kRepOk) { tr.failedStep = 3; return tr; }
+    // (c) 版本消息(0xFE = 未知命令:固件不识此邮箱消息号)。
+    tr.versionRep = tmp.SmuMsg(kMsgVersion, args);
+    if (tr.versionRep != kRepOk) { tr.failedStep = 4; return tr; }
+    tr.version = args[0];
+    // (d) 地址消息。
+    tr.addrRep = tmp.SmuMsg(kMsgAddr, args);
+    if (tr.addrRep != kRepOk) { tr.failedStep = 5; return tr; }
+    tr.addr = (static_cast<uint64_t>(args[1]) << 32) | args[0];
+    if (tr.addr == 0) { tr.failedStep = 6; return tr; }
+    // (e) 映射步:跳过(见上);(f) 首次 transfer:单发 0x65 只看响应码。
+    uint32_t targs[kArgCount] = {};
+    tr.transferRep = tmp.SmuMsg(kMsgTransfer, targs);
+    if (tr.transferRep != kRepOk) tr.failedStep = 8;
+    return tr;
+}
+
 } // namespace pd

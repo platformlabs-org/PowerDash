@@ -646,6 +646,16 @@ static int CmdPmDump(int argc, char* argv[]) {
         if (!pm) {
             std::cerr << "PMTable unavailable (SMU handshake failed; "
                          "Intel host or blocked PCI writes)" << std::endl;
+            /* Task 10:逐步重演握手取证 —— 精确失败步 + 各步响应码/版本/
+             * 地址(不映射;transfer 单发 0x65 只看响应码)。 */
+            const pd::SmuHandshakeTrace tr = pd::SmuPmTable::Diagnose(io);
+            fprintf(stderr,
+                    "handshake diag: failedStep=%d argReadback=0x%08X "
+                    "testRep=0x%02X versionRep=0x%02X addrRep=0x%02X "
+                    "transferRep=0x%02X version=0x%08X addr=0x%llX\n",
+                    tr.failedStep, tr.argReadback, tr.testRep, tr.versionRep,
+                    tr.addrRep, tr.transferRep, tr.version,
+                    (unsigned long long)tr.addr);
             rc = 2;
             break;
         }

@@ -1403,6 +1403,9 @@ struct SmuMailboxScript {
     bool serveTctl = false;
     unsigned rejectTransfer = 0;
     bool transferRejected = false;
+    // Task 10:msg 0x6 的 response 覆写(默认 0x1 与 Task 6 行为一致;
+    // 0xFE = 固件报未知命令,供 Diagnose 的 step4 脚本)。
+    uint32_t versionRep = 0x1u;
 };
 
 void InstallSmuMailbox(FixtureDriverIo& io, SmuMailboxScript& st) {
@@ -1425,6 +1428,7 @@ void InstallSmuMailbox(FixtureDriverIo& io, SmuMailboxScript& st) {
         if (st.serveTctl && a == 0x59800u) return st.tctlRaw;
         if (a == 0x3B10A80u) {                       // response
             if (st.lastMsg == 0x65u && st.transferRejected) return 0x80u;
+            if (st.lastMsg == 0x6u) return st.versionRep;
             return st.lastMsg ? 0x1u : 0x0u;
         }
         if (a == 0x3B10A88u) {                       // arg0
@@ -1465,6 +1469,56 @@ void TestSmuPmTableProtocol() {
     putf(0x04, 16.5f);       // At 跟随假物理内存演进
     Expect(pm->Refresh() && pm->At(0x04) == 16.5f,
            "At follows physMem after refresh");
+}
+
+// ---- Task 10: --pmdump 握手逐步诊断 SmuPmTable::Diagnose ----
+// 复用 Task 6 邮箱脚本:版本消息 0x6 应答 0xFE(未知命令)-> Diagnose 停在
+// step4 并记录 versionRep;健康邮箱 -> failedStep=0 全字段记录且从不映射
+// (fixture 不放物理内存,若误调 MapPhys 会留下 mapPhysBase 痕迹)。
+void TestSmuHandshakeDiagnose() {
+    // 场景 1:版本消息 0xFE(Krackan 排障主脚本:固件不识消息号)。
+    {
+        FixtureDriverIo io;
+        SmuMailboxScript st;
+        st.versionRep = 0xFEu;
+        InstallSmuMailbox(io, st);
+        const pd::SmuHandshakeTrace tr = pd::SmuPmTable::Diagnose(io);
+        Expect(tr.failedStep == 4,
+               "diag stops at the version message when it answers 0xFE");
+        Expect(tr.versionRep == 0xFEu, "diag records the 0xFE version response");
+        Expect(tr.argReadback == 0x47u, "diag step2 arg0 readback recorded");
+        Expect(tr.testRep == 0x1u, "diag step3 test message OK recorded");
+        Expect(tr.addrRep == 0u && tr.transferRep == 0u,
+               "steps after the first failure are not executed");
+        Expect(tr.version == 0u && tr.addr == 0ull,
+               "version/addr stay 0 when their own message failed");
+        // 同一 0xFE 脚本、全新状态机(lastMsg 归零)再跑 TryCreate:自检/
+        // 测试消息可通过,版本步 0xFE -> nullptr(证明 fixture 是真失败)。
+        SmuMailboxScript st2;
+        st2.versionRep = 0xFEu;
+        InstallSmuMailbox(io, st2);
+        Expect(pd::SmuPmTable::TryCreate(io) == nullptr,
+               "same 0xFE fixture: TryCreate still fails (version step)");
+    }
+    // 场景 2:健康邮箱全绿;不映射(fixture 无 physMem,MapPhys 必失败,
+    // mapPhysBase 仍 0 即证明诊断从未尝试映射)。
+    {
+        FixtureDriverIo io;
+        SmuMailboxScript st;
+        InstallSmuMailbox(io, st);
+        const pd::SmuHandshakeTrace tr = pd::SmuPmTable::Diagnose(io);
+        Expect(tr.failedStep == 0, "diag all-green on the healthy mailbox");
+        Expect(tr.argReadback == 0x47u && tr.testRep == 0x1u &&
+                   tr.versionRep == 0x1u && tr.addrRep == 0x1u,
+               "diag records each handshake response code");
+        Expect(tr.version == 0x00650005u,
+               "diag records the table version from msg 0x6");
+        Expect(tr.addr == 0x1000ull,
+               "diag records the table address from msg 0x66");
+        Expect(tr.transferRep == 0x1u,
+               "diag step8 single 0x65 transfer response recorded");
+        Expect(io.mapPhysBase == 0ull, "diag never maps physical memory");
+    }
 }
 
 void TestAmdProbePmTable() {
@@ -1911,6 +1965,7 @@ int main() {
     TestAmdProbePstateBaseClock();
     TestAmdProbeWideTable();
     TestSmuPmTableProtocol();
+    TestSmuHandshakeDiagnose();
     TestAmdProbePmTable();
     TestAmdProbeTscUnavailableEffNa();
     TestIntelProbeTscUnavailableEffNa();

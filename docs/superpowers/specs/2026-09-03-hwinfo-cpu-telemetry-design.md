@@ -30,7 +30,7 @@ PowerDash v2 采集 21 列固定宽表(pkg_w/cores_w/temp_c/...),字段广度远
 | PL1/PL2 | 静态 MSR 0x610 / 动态 MMIO 0x59A0(v2 已有动态) | PMTable STAPM/FPPT/SPPT(已知偏移) |
 | cTDP 档 | MSR 0x64B [1:0] | — |
 | 封装 C 驻留 | C2 0x60D / C3 0x3F8 / C6 0x3F9 / C8 0x630 / C10 0x632,÷ΔTSC | — |
-| 每核 C 驻留 | C1 0x660 / C6 0x3FD / C7 0x3FE(按核探测可读性);C0 = 100−C1 | C0 = ΔMPERF/ΔTSC(turbostat Busy% 同式) |
+| 每核 C 驻留 | C1 0x660 / C6 0x3FD / C7 0x3FE(按核探测可读性);C0 = ΔMPERF/ΔTSC(每线程,与 AMD 统一;turbostat Busy% 同式,MPERF 与 TSC 同基频节拍) | C0 = ΔMPERF/ΔTSC(turbostat Busy% 同式) |
 | Limit Reasons | MSR 0x64F(IA)/0x650(GT)/0x651(Ring),log 位 [26:16] 共 11 位 | — |
 | On-Demand Clock Modulation | MSR 0x19A(bit4 使能 + [3:0] 占空) | — |
 | EPP | —(HWiNFO intel.CSV 无此列) | MSR 0xC00102B3[31:24] → %(AMD CPPC_REQ,PPR) |
@@ -126,7 +126,7 @@ caps 逻辑降级,渲染层零改动)。
 | 功率 | CPU Package Power / IA Cores Power / GT Cores Power / Total System Power [W] | — |
 | 限值 | PL1/PL2 Power Limit (Static)/(Dynamic) [W] / Current cTDP Level [] | — |
 | 封装驻留 | Package C2/C3/C6/C8/C10 Residency [%] | — |
-| 核驻留 | Core C0/C1/C6/C7 Residency (avg) [%] | 每核 C0(=100−C1)/C1(0x660)/C6(0x3FD)/C7(0x3FE),按核可读性。驻留列为计数器原值占比(嵌套包含:C1 含 C6,C6 含 C7,turbostat 同式);Intel 每核列按代表 LP 读取(SMT 线程级如需再扩展) |
+| 核驻留 | Core C0/C1/C6/C7 Residency (avg) [%] | 每线程 C0(ΔMPERF/ΔTSC,列名 "<P/E-core n> T0 C0 Residency")/每核 C1(0x660)/C6(0x3FD)/C7(0x3FE),按核可读性。C1/C6/C7 驻留列为计数器原值占比(嵌套包含:C1 含 C6,C6 含 C7,turbostat 同式);Intel 每核列按代表 LP 读取(SMT 线程级如需再扩展) |
 | Limit Reasons | IA/GT/Ring Limit Reasons (avg) [Yes/No] + 各 11 位事件列(0x64F/0x650/0x651 log 位) | — |
 
 ### 4.2 AMD(实测机 Krackan Point,8C/16T 混合 Zen5+Zen5c)

@@ -10,6 +10,7 @@
 #include <cstring>
 #include <functional>
 #include <initializer_list>
+#include <intrin.h>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -714,6 +715,32 @@ void TestIntelProbeWideTable() {
     Expect(tb.Lookup("power.pkg").valid &&
                std::abs(tb.Lookup("power.pkg").value - 1.0) < 1e-6,
            "healthy columns keep decoding on the degraded frame");
+
+    // 第四/五拍:有效时钟单位回归 —— APERF 推进 2e7 raw,窗口用测试侧
+    // __rdtsc 忙等 ~10 ms 实测;eff = dA×tscHz/ΔTSC/1e6(列单位 MHz)。
+    // 本机量级:dA/ΔTSC ≈ 2e7/3.7e7 ≈ 0.54 -> eff ≈ 2000 MHz;公式断言
+    // ±10%(拍内偏移 µs 级),另加 MHz 合理带双保险 —— 若单位回退为 Hz,
+    // 读数放大 1e6 倍立即越带。
+    pd::Sample s4, s5;
+    Expect(probe->readSample(s4), "beat 4 re-anchors APERF/MPERF baseline");
+    const unsigned long long w1 = __rdtsc();
+    while (__rdtsc() - w1 < tscHz / 100) {}   // ~10 ms 忙等(窗口主体)
+    io.msrPerCore[{0, 0xE8}] = 20000000ull;   // dA = 2e7
+    io.msrPerCore[{1, 0xE8}] = 20000000ull;
+    io.msrPerCore[{0, 0xE7}] = 10000000ull;   // dM = 1e7(C0 同窗)
+    io.msrPerCore[{1, 0xE7}] = 10000000ull;
+    const unsigned long long w2 = __rdtsc();
+    Expect(probe->readSample(s5), "beat 5 reads the advanced APERF");
+    const double windowTicks = (double)(w2 - w1);
+    const double effExp = 20000000.0 * tscHz / windowTicks / 1e6;
+    for (const char* k : {"eff.0", "eff.all"}) {
+        const pd::Reading eff = tb.Lookup(k);
+        Expect(eff.valid, "effective clock decodes with advanced APERF");
+        Expect(eff.valid && eff.value > 0.0 && eff.value < 20000.0,
+               "effective clock in sane MHz band (unit regression)");
+        Expect(eff.valid && std::abs(eff.value - effExp) < 0.10 * effExp,
+               "effective clock = dAPERF*tscHz/dTSC/1e6 (MHz formula)");
+    }
 }
 
 // ---- Task 8: AmdProbe(保底监控集)----

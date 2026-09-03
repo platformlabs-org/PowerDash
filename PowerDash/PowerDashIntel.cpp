@@ -23,7 +23,6 @@
 #include "PowerDashProbe.h"
 #include "PowerDashSensors.h"
 #include "PowerDashUsage.h"
-#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -331,7 +330,7 @@ public:
                 L.prevAperf = a;
                 L.prevMperf = m;
                 if (dtsc <= 0.0) continue;
-                const double eff = dA * tscHz_ / dtsc;      // ΔAPERF/Δt = MHz
+                const double eff = dA * tscHz_ / dtsc / 1e6;   // ΔAPERF/Δt = 平均有效频率(tscHz 为 Hz,列单位 MHz)
                 const double c0 = dM / dtsc * 100.0;
                 table_.Set(L.idxC0, Ok(c0));
                 effCore[i].Add(eff);
@@ -872,7 +871,8 @@ private:
     unsigned nLP_ = 0;
     bool unitsOk_ = false;
     double energyUnit_ = 0.0, powerUnit_ = 0.0, timeUnitS_ = 0.0;
-    double tscHz_ = 0.0, busClock_ = 0.0;  // MHz;0 = 未知 -> 时钟列 NA
+    double tscHz_ = 0.0;                   // Hz(CalibrateTscHz 原样;eff 换算 /1e6)
+    double busClock_ = 0.0;                // MHz;0 = 未知 -> 时钟列 NA
     void* map_ = nullptr;
     volatile uint32_t* pl_ = nullptr;      // pl_[0]=PL1 raw, pl_[1]=PL2 raw
     std::unique_ptr<UsageMonitor> usage_;

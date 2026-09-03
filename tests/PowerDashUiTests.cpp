@@ -64,45 +64,6 @@ void TestPowerArgumentsRejectMissingCsvPathAndInvalidDuration() {
            "zero duration should fail");
 }
 
-void TestCsvHasStableColumnsAndEscapesText() {
-    const std::string expectedHeader =
-        "timestamp,elapsed_s,platform,pkg_w,cores_w,gfx_w,platform_w,"
-        "limit_sustained_w,limit_sustained_window_s,limit_burst_w,limit_locked,"
-        "tdc_a,edc_a,temp_c,freq_ghz,util_pct,c0_pct,c2_pct,c6_pct,smi_delta,mode";
-    Expect(pd::CsvHeader() == expectedHeader, "CSV header columns changed");
-
-    pd::Sample sample;                        // v2 fixture: gfx/tdc/edc invalid
-    sample.timestamp = "2026-09-01T12:34:56";
-    sample.elapsedS = 1.0;
-    sample.pkgW = pd::Ok(12.345);
-    sample.coresW = pd::Ok(8.5);
-    sample.gfxW = pd::NA();
-    sample.platformW = pd::Ok(1.75);
-    sample.powerLimit.sustainedW = pd::Ok(28.0);
-    sample.powerLimit.sustainedWindowS = pd::Ok(0.002);
-    sample.powerLimit.burstW = pd::Ok(45.0);
-    sample.powerLimit.locked = true;
-    sample.currentLimit.tdcA = pd::NA();
-    sample.currentLimit.edcA = pd::NA();
-    sample.tempC = pd::Ok(67);
-    sample.freqGHz = pd::Ok(3.125);
-    sample.utilPct = pd::Ok(7.5);
-    sample.c0Pct = pd::Ok(42.0);
-    sample.c2Pct = pd::Ok(18.0);
-    sample.c6Pct = pd::Ok(40.0);
-    sample.smiDelta = 2;
-    sample.mode = "Intelligent, Auto";
-
-    const std::string expectedRow =
-        "2026-09-01T12:34:56,1.000,intel,12.345,8.500,,1.750,"
-        "28.000,0.002,45.000,1,,,67,3.125,7.500,"
-        "42.000,18.000,40.000,2,"
-        "\"Intelligent, Auto\"";
-    Expect(pd::CsvRow(pd::Vendor::Intel, sample) == expectedRow,
-           "CSV row should preserve precision, blank invalid cells and "
-           "quote commas");
-}
-
 void TestLogoIsCenteredAndColorDoesNotChangeItsWidth() {
     const std::string plain = pd::RenderLogo(72, false);
     const std::string colored = pd::RenderLogo(72, true);
@@ -1727,10 +1688,25 @@ void TestSamplerDrivesSinkAndFillsPlatformIndependentFields() {
     bool ok = s.Run(2.0, [&](const pd::Sample& x) { got.push_back(x); });
     Expect(ok, "sampler completes scripted run");
     Expect(got.size() == 2, "one sink call per tick");
-    Expect(got[0].utilPct.valid, "sampler fills utilization");
     Expect(got[0].mode == "Intelligent (APM)", "sampler fills mode");
     Expect(!got[0].timestamp.empty() && got[0].elapsedS >= 0.0,
            "sampler fills timestamp/elapsed");
+}
+
+// v3 Task 7:utilPct 归探针 —— Sampler 删 GetSystemTimes 差分,probe 在
+// readSample 写入的 utilPct(含 NA 暖机帧)必须原样到达 sink。
+void TestSamplerLeavesUtilToProbe() {
+    FakeProbe p;
+    pd::Sample a; a.pkgW = pd::Ok(1.0); a.utilPct = pd::Ok(33.0);
+    p.script = {a};
+    pd::Sampler sampler(p, nullptr, nullptr, [] {});   // 无等待,立即返回
+    int seen = 0;
+    sampler.Run(0.5, [&](const pd::Sample& s) {        // runSeconds 0.5 → 1 帧
+        Expect(s.utilPct.valid && s.utilPct.value == 33.0,
+               "util comes from probe");
+        ++seen;
+    });
+    Expect(seen >= 1, "at least one frame sampled");
 }
 
 void TestSamplerExitsAfterFiveConsecutiveFailures() {
@@ -1915,7 +1891,6 @@ void TestHwDateTimeFormats() {
 int main() {
     TestPowerArgumentsAcceptDurationAndCsvInEitherOrder();
     TestPowerArgumentsRejectMissingCsvPathAndInvalidDuration();
-    TestCsvHasStableColumnsAndEscapesText();
     TestLogoIsCenteredAndColorDoesNotChangeItsWidth();
     TestWideDashboardBalancesAtAGlanceAndDiagnosticInformation();
     TestNarrowDashboardStacksGroupsWithoutDroppingMetrics();
@@ -1940,6 +1915,7 @@ int main() {
     TestAmdProbeTscUnavailableEffNa();
     TestIntelProbeTscUnavailableEffNa();
     TestSamplerDrivesSinkAndFillsPlatformIndependentFields();
+    TestSamplerLeavesUtilToProbe();
     TestSamplerExitsAfterFiveConsecutiveFailures();
     TestUsageMonitorDiff();
     TestNtUsageSourceInstantiates();

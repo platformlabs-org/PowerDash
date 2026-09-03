@@ -3,6 +3,7 @@
 #include "PowerDashUi.h"
 #include "PowerDashProbe.h"
 #include "PowerDashSampler.h"
+#include "PowerDashSensors.h"  // CSV v3 写出器(CsvHeaderV3/CsvRowV3/FormatHw*)
 #include "PowerDashUsage.h"   // pd::ParseCoreTopology(QueryCoreTopologyV2 用)
 #include "PowerDashIoctl.h"
 #include <iostream>
@@ -618,18 +619,6 @@ static int CmdMsrDbg(int argc, char* argv[]) {
 
 static int RunMonitor(int argc, char* argv[],
                       const pd::MonitorOptions& monitorOptions = {}) {
-    std::ofstream csv;
-    if (!monitorOptions.csvPath.empty()) {
-        csv.open(monitorOptions.csvPath, std::ios::out | std::ios::trunc);
-        if (!csv) {
-            std::cerr << "cannot create CSV file: " << monitorOptions.csvPath
-                      << std::endl;
-            return 2;
-        }
-        csv << pd::CsvHeader() << '\n';
-        csv.flush();
-    }
-
     HANDLE hDriver = EnsureDriverLoaded();   /* transparent install if needed */
 
     if (hDriver == INVALID_HANDLE_VALUE) {
@@ -751,6 +740,26 @@ static int RunMonitor(int argc, char* argv[],
     }
     const pd::PlatformCaps& caps = probe->caps();
 
+    /* ---- CSV v3: opened after probe creation so the header mirrors the
+     * probe's wide sensor table (Date/Time/Elapsed/Power Mode + one column
+     * per sensor, HWiNFO naming). Both v3 probes expose sensors(); the
+     * nullptr guard is an unreachable belt-and-braces check. ---- */
+    std::ofstream csv;
+    if (!monitorOptions.csvPath.empty()) {
+        if (!probe->sensors()) {
+            std::cerr << "probe has no sensor table" << std::endl;
+            rc = 1; break;
+        }
+        csv.open(monitorOptions.csvPath, std::ios::out | std::ios::trunc);
+        if (!csv) {
+            std::cerr << "cannot create CSV file: " << monitorOptions.csvPath
+                      << std::endl;
+            rc = 2; break;
+        }
+        csv << pd::CsvHeaderV3(*probe->sensors()) << '\n';
+        csv.flush();
+    }
+
     std::cout << std::fixed << std::setprecision(2);
 
     /* ---- display setup: a grouped dashboard, redrawn in place ---- */
@@ -822,7 +831,16 @@ static int RunMonitor(int argc, char* argv[],
         [&](const pd::Sample& sample) {
 
         if (csv.is_open()) {
-            csv << pd::CsvRow(caps.vendor, sample) << '\n';
+            /* v3 row: local wall clock split into HWiNFO's d.m.yyyy and
+             * h:mm:ss.fff forms; elapsed/mode come from the sampler fill */
+            SYSTEMTIME st = {};
+            GetLocalTime(&st);
+            const std::string date = pd::FormatHwDate(
+                st.wDay, st.wMonth, st.wYear);
+            const std::string time = pd::FormatHwTime(
+                st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+            csv << pd::CsvRowV3(*probe->sensors(), date, time,
+                                sample.elapsedS, sample.mode) << '\n';
             csv.flush();
             if (!csv) {
                 std::cerr << "CSV write failed: " << monitorOptions.csvPath

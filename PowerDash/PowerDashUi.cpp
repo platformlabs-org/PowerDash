@@ -31,18 +31,6 @@ std::string Color(bool ansi, const char* color, const std::string& text) {
     return ansi ? std::string(color) + text + RESET : text;
 }
 
-std::string CsvEscape(const std::string& value) {
-    if (value.find_first_of(",\"\r\n") == std::string::npos)
-        return value;
-    std::string escaped = "\"";
-    for (char ch : value) {
-        if (ch == '\"') escaped += '\"';
-        escaped += ch;
-    }
-    escaped += '\"';
-    return escaped;
-}
-
 std::string Fit(const std::string& text, std::size_t width) {
     if (VisibleLength(text) <= width)
         return text + std::string(width - VisibleLength(text), ' ');
@@ -174,44 +162,6 @@ bool ParsePowerArguments(const std::vector<std::string>& args,
         options.runSeconds = seconds;
     }
     return true;
-}
-
-std::string CsvHeader() {
-    return "timestamp,elapsed_s,platform,pkg_w,cores_w,gfx_w,platform_w,"
-           "limit_sustained_w,limit_sustained_window_s,limit_burst_w,limit_locked,"
-           "tdc_a,edc_a,temp_c,freq_ghz,util_pct,c0_pct,c2_pct,c6_pct,smi_delta,mode";
-}
-
-/* CSV v2: invalid Reading -> EMPTY cell (never "0"), limit_locked 0/1,
- * platform in {intel, amd} (spec section 6). */
-std::string CsvRow(Vendor vendor, const Sample& sample) {
-    auto cell = [](const Reading& r, int precision) {
-        return r.valid ? Fixed(r.value, precision) : std::string();
-    };
-    std::ostringstream out;
-    out << CsvEscape(sample.timestamp)
-        << ',' << Fixed(sample.elapsedS, 3)
-        << ',' << (vendor == Vendor::Amd ? "amd" : "intel")
-        << ',' << cell(sample.pkgW, 3)
-        << ',' << cell(sample.coresW, 3)
-        << ',' << cell(sample.gfxW, 3)
-        << ',' << cell(sample.platformW, 3)
-        << ',' << cell(sample.powerLimit.sustainedW, 3)
-        << ',' << cell(sample.powerLimit.sustainedWindowS, 3)
-        << ',' << cell(sample.powerLimit.burstW, 3)
-        << ',' << (sample.powerLimit.locked ? 1 : 0)
-        << ',' << cell(sample.currentLimit.tdcA, 3)
-        << ',' << cell(sample.currentLimit.edcA, 3)
-        << ',' << cell(sample.tempC, 0)
-        << ',' << cell(sample.freqGHz, 3)
-        << ',' << cell(sample.utilPct, 3)
-        << ',' << cell(sample.c0Pct, 3)
-        << ',' << cell(sample.c2Pct, 3)
-        << ',' << cell(sample.c6Pct, 3)
-        << ',';
-    if (sample.smiDelta.has_value()) out << *sample.smiDelta;
-    out << ',' << CsvEscape(sample.mode);
-    return out.str();
 }
 
 std::size_t VisibleLength(const std::string& text) {

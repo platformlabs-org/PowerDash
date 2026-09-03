@@ -1,7 +1,8 @@
 #pragma once
-// PowerDashUi.h —— 面板渲染与 CSV 写入,只消费统一模型(Sample v2 +
+// PowerDashUi.h —— 面板渲染与参数解析,只消费统一模型(Sample v2 +
 // PlatformCaps,见 PowerDashModel.h)。平台差异经 caps 控制区块显隐,
-// 渲染层不出现任何 MSR/平台寄存器概念(spec 第 2/5 节)。
+// 渲染层不出现任何 MSR/平台寄存器概念(spec 第 2/5 节)。CSV 写出走
+// PowerDashSensors.h 的 v3 写出器(Task 7 起 v2 CsvHeader/CsvRow 已删)。
 #include <cstddef>
 #include <string>
 #include <vector>
@@ -27,8 +28,6 @@ struct DashboardInfo {             // 平台无关的展示上下文
 
 bool ParsePowerArguments(const std::vector<std::string>& args,
                          MonitorOptions& options, std::string& error);
-std::string CsvHeader();           // CSV v2 列(spec 第 6 节)
-std::string CsvRow(Vendor vendor, const Sample& sample);
 std::size_t VisibleLength(const std::string& text);
 std::string RenderLogo(int width, bool ansi);
 std::string RenderDashboard(const DashboardInfo& info,

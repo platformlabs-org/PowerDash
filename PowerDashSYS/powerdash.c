@@ -716,6 +716,45 @@ NTSTATUS deviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
                 break;
             }
 
+            case IO_CTL_SMN_WRITE:
+            {
+                struct SMN_Request* req = (struct SMN_Request*)Irp->AssociatedIrp.SystemBuffer;
+                ULONG32 smnAddr = 0, smnData = 0;
+                if (inputSize < sizeof(struct SMN_Request))
+                {
+                    status = STATUS_INVALID_PARAMETER;
+                    break;
+                }
+                slot.u.AsULONG = 0;                          /* B0:D0:F0 */
+                ExAcquireFastMutex(&pExt->smnMutex);
+#pragma warning(push)
+#pragma warning(disable: 4996)
+                __try
+                {
+                    smnAddr = req->address;
+                    smnData = req->value;
+                    if (HalSetBusDataByOffset(PCIConfiguration, 0, slot.u.AsULONG,
+                                              &smnAddr, 0x60, 4) != 4)
+                    {
+                        status = STATUS_DEVICE_NOT_READY;
+                    }
+                    else if (HalSetBusDataByOffset(PCIConfiguration, 0, slot.u.AsULONG,
+                                                   &smnData, 0x64, 4) != 4)
+                    {
+                        status = STATUS_DEVICE_NOT_READY;
+                    }
+                }
+                __except (EXCEPTION_EXECUTE_HANDLER)
+                {
+                    status = GetExceptionCode();
+                    DbgPrint("PowerDash: SMN write exception 0x%X addr 0x%X\n", status, req->address);
+                }
+#pragma warning(pop)
+                ExReleaseFastMutex(&pExt->smnMutex);
+                Irp->IoStatus.Information = 0;
+                break;
+            }
+
             case IO_CTL_FNQ_INJECT:
                 FnQInject(output);          /* count of events, or 0x8ZZSSSS error code */
                 Irp->IoStatus.Information = sizeof(ULONG64);

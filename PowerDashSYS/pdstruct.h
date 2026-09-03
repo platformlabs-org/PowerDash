@@ -24,6 +24,7 @@
 #define IO_CTL_PMU_FREE          CTL_CODE(POWERDASH_DEV_TYPE, 0x809, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IO_CTL_FNQ_INJECT        CTL_CODE(POWERDASH_DEV_TYPE, 0x80A, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IO_CTL_SMN_READ          CTL_CODE(POWERDASH_DEV_TYPE, 0x80B, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IO_CTL_SMN_WRITE         CTL_CODE(POWERDASH_DEV_TYPE, 0x80C, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 struct MSR_Request
 {
@@ -50,7 +51,8 @@ struct MMAP_Request
 struct SMN_Request
 {
     ULONG32 address;      // SMN address (e.g. 0x59800)
-    ULONG32 value;        // output: 32-bit content of that address
+    ULONG32 value;        // read request: output, 32-bit content of that address
+                          // write request: input, value to write (SMU mailbox 0x3B10xxx needs writes)
 };
 
 

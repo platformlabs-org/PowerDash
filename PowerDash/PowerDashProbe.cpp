@@ -66,6 +66,17 @@ bool WindowsDriverIo::ReadSmn(uint32_t smnAddr, uint32_t& out) {
     return true;
 }
 
+bool WindowsDriverIo::WriteSmn(uint32_t smnAddr, uint32_t value) {
+    // 同 ReadSmn 形态但无回读:驱动侧在互斥内写 0x60(地址)/0x64(数据),
+    // Information = 0,故输出缓冲传空。
+    SMN_Request req{};
+    req.address = smnAddr;
+    req.value = value;
+    DWORD returned = 0;
+    return DeviceIoControl(h_, IO_CTL_SMN_WRITE, &req, sizeof(req),
+                           nullptr, 0, &returned, nullptr) != FALSE;
+}
+
 bool WindowsDriverIo::MapPhys(uint64_t phys, size_t len, void*& virt) {
     MMAP_Request req{};
     req.address.QuadPart = (LONGLONG)phys;

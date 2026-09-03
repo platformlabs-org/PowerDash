@@ -5,8 +5,8 @@
 namespace pd {
 
 // 驱动 IO 原语抽象:生产环境包装 DeviceIoControl(WindowsDriverIo),
-// 测试中用 FixtureDriverIo 注入应答。SMN 访问必须走 ReadSmn(驱动内
-// 原子互斥的 IO_CTL_SMN_READ),禁止用户态拆写 0x60/0x64。
+// 测试中用 FixtureDriverIo 注入应答。SMN 访问必须走 ReadSmn/WriteSmn
+// (驱动内原子互斥的 IO_CTL_SMN_READ/WRITE),禁止用户态拆写 0x60/0x64。
 class DriverIo {
 public:
     virtual ~DriverIo() = default;
@@ -16,6 +16,7 @@ public:
     virtual bool WritePciCfg(unsigned bus, unsigned dev, unsigned fn,
                              unsigned reg, uint32_t value) = 0;
     virtual bool ReadSmn(uint32_t smnAddr, uint32_t& out) = 0;
+    virtual bool WriteSmn(uint32_t smnAddr, uint32_t value) = 0;
     virtual bool MapPhys(uint64_t phys, size_t len, void*& virt) = 0;
     virtual void UnmapPhys(void* virt) = 0;
 };
@@ -29,6 +30,7 @@ public:
     bool WritePciCfg(unsigned bus, unsigned dev, unsigned fn,
                      unsigned reg, uint32_t value) override;
     bool ReadSmn(uint32_t smnAddr, uint32_t& out) override;   // Task 7 前 return false
+    bool WriteSmn(uint32_t smnAddr, uint32_t value) override;
     bool MapPhys(uint64_t phys, size_t len, void*& virt) override;
     void UnmapPhys(void* virt) override;
 private:

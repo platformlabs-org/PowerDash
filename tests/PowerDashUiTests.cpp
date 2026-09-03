@@ -385,6 +385,7 @@ public:
         if (it == smn.end()) return false;
         out = it->second; return true;
     }
+    bool WriteSmn(uint32_t, uint32_t) override { return false; }   // 后续任务扩展为可编程
     bool MapPhys(uint64_t, size_t, void*&) override { return false; }
     void UnmapPhys(void*) override {}
 };

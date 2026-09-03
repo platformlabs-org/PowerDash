@@ -4,6 +4,7 @@
 #include "PowerDashProbe.h"
 #include "PowerDashSampler.h"
 #include "PowerDashSensors.h"  // CSV v3 写出器(CsvHeaderV3/CsvRowV3/FormatHw*)
+#include "PowerDashPmTable.h"  // SmuPmTable(--pmdump 调试导出用)
 #include "PowerDashUsage.h"   // pd::ParseCoreTopology(QueryCoreTopologyV2 用)
 #include "PowerDashIoctl.h"
 #include <iostream>
@@ -541,7 +542,14 @@ static int CmdMode(int argc, char* argv[]) {
  * PowerDash --msrdbg <core> <hexmsr> - same idea for a per-core MSR:
  * read twice one second apart so energy counters (0xC001029A/B) show a
  * visible delta while static registers (P-state defs) repeat verbatim.
- * Used to map per-LP counters to physical cores on real hardware. */
+ * Used to map per-LP counters to physical cores on real hardware.
+ *
+ * PowerDash --pmdump [outfile] - dump the first 0x1000 bytes of the SMU
+ * PMTable one 4-byte row per line ("off  hex  float"; hex via AtBits, the
+ * same bits reinterpreted as the float column). Evidence tool for the
+ * offset-mapping session: correlate the float column against HWiNFO live
+ * values to identify fields on new PMTable versions. Rows go to stdout,
+ * or entirely to outfile with a one-line note on stdout. */
 
 static int CmdSmnDbg(int argc, char* argv[]) {
     if (argc != 3) {
@@ -608,6 +616,77 @@ static int CmdMsrDbg(int argc, char* argv[]) {
                 rc = 2;
             }
             if (i == 0) Sleep(1000);   /* 1 s apart: deltas become visible */
+        }
+    } while (0);
+    CloseHandle(hDriver);
+    RemoveOursDriver();
+    return rc;
+}
+
+/* 全表导出:握手(版本/地址)-> Refresh -> 0x00..0xFFC 每 4 字节一行
+ * "偏移  原始十六进制  浮点解释"。十六进制列走 AtBits(与 At 同一越界
+ * 语义,false 行跳过),浮点列就是同 4 字节的位重解释 —— 可疑值可以
+ * 对着位模式核。outfile 给定时行只写文件,stdout 只留一行提示。 */
+static int CmdPmDump(int argc, char* argv[]) {
+    if (argc > 3) {
+        std::cout << "usage: PowerDash --pmdump [outfile]" << std::endl;
+        return 1;
+    }
+    const char* outfile = (argc == 3) ? argv[2] : nullptr;
+
+    HANDLE hDriver = EnsureDriverLoaded();
+    if (hDriver == INVALID_HANDLE_VALUE) {
+        std::cerr << "Failed to open driver." << std::endl;
+        return 1;
+    }
+    int rc = 0;
+    do {
+        pd::WindowsDriverIo io(hDriver);
+        auto pm = pd::SmuPmTable::TryCreate(io);
+        if (!pm) {
+            std::cerr << "PMTable unavailable (SMU handshake failed; "
+                         "Intel host or blocked PCI writes)" << std::endl;
+            rc = 2;
+            break;
+        }
+        printf("PMTable version: 0x%08X  addr: 0x%llX\n", pm->version(),
+               (unsigned long long)pm->addr());
+        pm->Refresh();   /* TryCreate 已 transfer 过一次;再刷一次取最新帧 */
+
+        std::ofstream file;
+        if (outfile) {
+            file.open(outfile, std::ios::out | std::ios::trunc);
+            if (!file) {
+                std::cerr << "cannot create output file: " << outfile
+                          << std::endl;
+                rc = 3;
+                break;
+            }
+        }
+        uint32_t rows = 0;
+        for (uint32_t off = 0; off <= 0xFFCu; off += 4) {
+            uint32_t bits = 0;
+            if (!pm->AtBits(off, bits)) continue;   /* 越界/未刷新:跳行 */
+            float f = 0.0f;
+            memcpy(&f, &bits, 4);                   /* 同 4 字节的浮点解释 */
+            char line[48];
+            sprintf_s(line, "%04x  %08X  %g\n", off, bits, f);
+            if (file.is_open()) file << line;
+            else std::cout << line;
+            ++rows;
+        }
+        std::cout << rows << " rows dumped" << std::endl;
+        std::cout << "correlate with HWiNFO live values to map offsets "
+                     "(Krackan known: 0x00/0x04 STAPM, 0x30/0x34 TDC, "
+                     "0x40/0x44 Tctl)" << std::endl;
+        if (file.is_open()) {
+            file.close();
+            if (!file) {
+                std::cerr << "write failed: " << outfile << std::endl;
+                rc = 3;
+            } else {
+                std::cout << "written to " << outfile << std::endl;
+            }
         }
     } while (0);
     CloseHandle(hDriver);
@@ -1031,6 +1110,7 @@ int main(int argc, char* argv[]) {
     if (cmd == "mode")   return CmdMode(argc, argv);
     if (cmd == "--smndbg") return CmdSmnDbg(argc, argv);
     if (cmd == "--msrdbg") return CmdMsrDbg(argc, argv);
+    if (cmd == "--pmdump") return CmdPmDump(argc, argv);
     if (cmd == "power") {
         std::vector<std::string> args;
         for (int i = 2; i < argc; ++i) args.emplace_back(argv[i]);

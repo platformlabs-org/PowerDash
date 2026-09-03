@@ -91,6 +91,19 @@ float SmuPmTable::At(uint32_t byteOff) const {
     return f;
 }
 
+/* 表内原始 4 字节读取(--pmdump 十六进制列):与 At 同一越界/刷新/映射
+ * 语义,仅不做位转换 —— false = 该行不在窗口/未刷新(调用方跳过该行,
+ * 不猜 0)。 */
+bool SmuPmTable::AtBits(uint32_t byteOff, uint32_t& out) const {
+    out = 0;
+    if (map_ == nullptr || !refreshed_) return false;
+    if (size_ < 4 || byteOff > size_ - 4u) return false;
+    const auto* p = static_cast<const uint8_t*>(map_) +
+                    (addr_ & 0xFFFull) + byteOff;
+    std::memcpy(&out, p, 4);                    // 4 字节位拷贝(无别名 UB)
+    return true;
+}
+
 /* 握手 + 映射 + 首帧刷新;任一步失败 nullptr(调用方诚实降级,不猜)。 */
 std::unique_ptr<SmuPmTable> SmuPmTable::TryCreate(DriverIo& io) {
     std::unique_ptr<SmuPmTable> t(new SmuPmTable(io));

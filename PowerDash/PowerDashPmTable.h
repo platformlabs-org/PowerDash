@@ -16,6 +16,7 @@ public:
     ~SmuPmTable();                        // UnmapPhys 映射窗口
     bool Refresh();                       // 每帧:transfer 0x65(拒绝→10ms 重试一次)
     float At(uint32_t byteOff) const;     // float@偏移;越界/未刷新 NAN
+    bool AtBits(uint32_t byteOff, uint32_t& out) const;  // 原始 4 字节@偏移;越界/未刷新 false(--pmdump 十六进制列)
     uint32_t version() const { return version_; }
     uint64_t addr() const { return addr_; }
 

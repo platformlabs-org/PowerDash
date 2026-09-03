@@ -145,6 +145,7 @@
     <ClCompile Include="PowerDashIntel.cpp" />
     <ClCompile Include="PowerDashProbe.cpp" />
     <ClCompile Include="PowerDashSampler.cpp" />
+    <ClCompile Include="PowerDashSensors.cpp" />
     <ClCompile Include="PowerDashUi.cpp" />
   </ItemGroup>
   <ItemGroup>
@@ -152,6 +153,7 @@
     <ClInclude Include="PowerDashModel.h" />
     <ClInclude Include="PowerDashProbe.h" />
     <ClInclude Include="PowerDashSampler.h" />
+    <ClInclude Include="PowerDashSensors.h" />
     <ClInclude Include="PowerDashUi.h" />
   </ItemGroup>
   <ItemGroup>

@@ -1,6 +1,7 @@
 #include "../PowerDash/PowerDashModel.h"
 #include "../PowerDash/PowerDashProbe.h"
 #include "../PowerDash/PowerDashSampler.h"
+#include "../PowerDash/PowerDashSensors.h"
 #include "../PowerDash/PowerDashUi.h"
 
 #include <cmath>
@@ -835,6 +836,48 @@ void TestSamplerExitsAfterFiveConsecutiveFailures() {
     Expect(sinks == 0, "failed frames never reach the sink");
 }
 
+// ---------- v3 SensorTable / CSV ----------
+void TestSensorTableBasics() {
+    pd::SensorTable t;
+    unsigned a = t.Add("pkg.power", "CPU Package Power [W]", pd::SensorFmt::F3);
+    unsigned b = t.Add("flags.pkg.thermal", "Package/Ring Thermal Throttling [Yes/No]", pd::SensorFmt::YESNO);
+    Expect(a == 0 && b == 1, "Add returns sequential indices");
+    Expect(t.Find("pkg.power") == 0 && t.Find("nope") == -1, "Find by key");
+    t.Set(a, pd::Ok(12.5));
+    t.SetInvalid(b);
+    Expect(!t.Get(b).valid, "SetInvalid");
+    Expect(t.Lookup("nope").valid == false, "missing key -> NA");
+    Expect(t.Lookup("pkg.power").value == 12.5, "Lookup value");
+}
+
+void TestFormatSensorCell() {
+    Expect(pd::FormatSensorCell(pd::Ok(2417.44), pd::SensorFmt::F1) == "2417.4", "F1 1 decimal");
+    Expect(pd::FormatSensorCell(pd::Ok(0.703125), pd::SensorFmt::F3) == "0.703", "F3 3 decimals");
+    Expect(pd::FormatSensorCell(pd::Ok(17.0625), pd::SensorFmt::RATIO2) == "17.06", "ratio 2 decimals");
+    Expect(pd::FormatSensorCell(pd::Ok(99.96), pd::SensorFmt::PCT1) == "100.0", "PCT1 rounds");
+    Expect(pd::FormatSensorCell(pd::Ok(1.0), pd::SensorFmt::YESNO) == "Yes", "YESNO true");
+    Expect(pd::FormatSensorCell(pd::Ok(0.0), pd::SensorFmt::YESNO) == "No", "YESNO false");
+    Expect(pd::FormatSensorCell(pd::NA(), pd::SensorFmt::F1).empty(), "invalid -> empty cell");
+}
+
+void TestCsvV3HeaderAndRow() {
+    pd::SensorTable t;
+    t.Add("clock.avg", "Core Clocks (avg) [MHz]", pd::SensorFmt::F1);
+    t.Add("flags.pkg.thermal", "Package/Ring Thermal Throttling [Yes/No]", pd::SensorFmt::YESNO);
+    const std::string hdr = pd::CsvHeaderV3(t);
+    Expect(hdr == "Date,Time,\"Elapsed [s]\",\"Power Mode\",\"Core Clocks (avg) [MHz]\","
+                  "\"Package/Ring Thermal Throttling [Yes/No]\"", "v3 header exact");
+    t.Set(0, pd::Ok(2417.44));
+    t.SetInvalid(1);
+    const std::string row = pd::CsvRowV3(t, "3.9.2026", "16:20:07.782", 1.0, "Intelligent (STD)");
+    Expect(row == "3.9.2026,16:20:07.782,1.000,Intelligent (STD),2417.4,", "v3 row exact (trailing empty cell)");
+}
+
+void TestHwDateTimeFormats() {
+    Expect(pd::FormatHwDate(3, 9, 2026) == "3.9.2026", "HWiNFO date no zero pad");
+    Expect(pd::FormatHwTime(1, 20, 7, 782) == "1:20:07.782", "HWiNFO time no zero pad");
+}
+
 } // namespace
 
 int main() {
@@ -859,6 +902,10 @@ int main() {
     TestAmdProbePstateBaseClock();
     TestSamplerDrivesSinkAndFillsPlatformIndependentFields();
     TestSamplerExitsAfterFiveConsecutiveFailures();
+    TestSensorTableBasics();
+    TestFormatSensorCell();
+    TestCsvV3HeaderAndRow();
+    TestHwDateTimeFormats();
 
     if (failures != 0) {
         std::cerr << failures << " test assertion(s) failed\n";

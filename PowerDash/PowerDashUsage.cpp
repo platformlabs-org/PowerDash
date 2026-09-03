@@ -3,6 +3,7 @@
 // class 8 布局),这里自声明 x64 结构:Idle/Kernel/User 位于偏移 0/8/16,
 // 其余字段与 busy% 无关,仅用于钉住总大小 48 字节。
 #include <windows.h>
+#include <algorithm>
 #include <cstdint>
 
 namespace pd {
@@ -108,6 +109,40 @@ LpUsage UsageMonitor::Read() {
     out.maxPct = mx;
     out.ok = true;
     return out;
+}
+
+bool ParseCoreTopology(const unsigned char* buf, unsigned long bytes,
+                       std::vector<CoreInfo>& cores) {
+    cores.clear();
+    if (!buf) return false;
+    // 条目头 = Relationship(ULONG @0)+ Size(ULONG @4),共 8 字节。准入只
+    // 检查头(48 字节核条目 < 80 字节 sizeof(EX),见头文件注释);步进按
+    // e->Size,零/越界 Size 直接判失败(宁可无拓扑也不误报)。
+    constexpr unsigned long kHeaderBytes = 8;
+    for (unsigned long off = 0; off + kHeaderBytes <= bytes; ) {
+        const auto* e = reinterpret_cast<
+            const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buf + off);
+        if (e->Size < kHeaderBytes || off + e->Size > bytes)
+            return false;                  // 破损条目
+        if (e->Relationship == RelationProcessorCore) {
+            const PROCESSOR_RELATIONSHIP& r = e->Processor;
+            if (r.GroupCount != 1)
+                return false;              // 跨组条目:编号语义不支持,整体退回
+            if (r.GroupMask[0].Group != 0)
+                return false;              // 同上:mask 落在非 0 组
+            CoreInfo ci;
+            ci.effClass = r.EfficiencyClass;   // 仅 RelationProcessorCore 有效
+            const KAFFINITY mask = r.GroupMask[0].Mask;
+            for (unsigned bit = 0; bit < 64; ++bit)
+                if (mask & ((KAFFINITY)1 << bit))
+                    ci.threads.push_back(bit);
+            if (ci.threads.empty()) return false;
+            ci.repLP = *std::min_element(ci.threads.begin(), ci.threads.end());
+            cores.push_back(std::move(ci));
+        }
+        off += e->Size;                    // >= kHeaderBytes,循环必前进
+    }
+    return !cores.empty();
 }
 
 } // namespace pd

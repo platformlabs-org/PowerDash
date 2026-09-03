@@ -7,6 +7,7 @@
 
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <initializer_list>
 #include <iostream>
@@ -885,6 +886,96 @@ void TestCoreInfoFallback() {            // PlatformInfo::cores 空时探针退�
     Expect(info.cores.empty(), "fallback = empty cores (probe synthesizes all-LP)");
 }
 
+// ---- Task 3 修复:ParseCoreTopology 合成缓冲单测 ----
+// x64 SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX(RelationProcessorCore)手工
+// 布局(SDK winnt.h:GroupMask[ANYSIZE_ARRAY] 数组,无 union):头 8 字节
+// (Relationship ULONG @0、Size ULONG @4)+ PROCESSOR_RELATIONSHIP
+// {Flags @8、EfficiencyClass @9、Reserved[20] @10、GroupCount WORD @30、
+// GroupMask[0].Mask KAFFINITY @32、GroupMask[0].Group WORD @40} = 48 字节。
+std::vector<unsigned char> CoreExEntry(unsigned long long mask,
+                                       unsigned effClass,
+                                       unsigned short groupCount = 1,
+                                       unsigned short group = 0,
+                                       unsigned long entrySize = 48) {
+    // 实际分配取 max(entrySize, 48):builder 要写满头部+GroupMask[0]
+    // (偏移 0..41),Size=0 畸形条目也需占位字节(头里写声称值 0)。
+    std::vector<unsigned char> e(entrySize < 48 ? 48 : entrySize, 0);
+    const auto put16 = [&e](size_t off, unsigned short v) {
+        memcpy(e.data() + off, &v, sizeof(v));
+    };
+    const auto put32 = [&e](size_t off, unsigned long v) {
+        memcpy(e.data() + off, &v, sizeof(v));
+    };
+    const auto put64 = [&e](size_t off, unsigned long long v) {
+        memcpy(e.data() + off, &v, sizeof(v));
+    };
+    put32(0, 0);                    // Relationship = RelationProcessorCore
+    put32(4, entrySize);            // Size
+    e[9] = (unsigned char)effClass;
+    put16(30, groupCount);          // GroupCount
+    put64(32, mask);                // GroupMask[0].Mask
+    put16(40, group);               // GroupMask[0].Group
+    return e;
+}
+
+void TestParseCoreTopology() {
+    // 回归(评审实测形态):16 条目 x 48 字节 = 768。旧准入
+    // off + sizeof(EX)=80 <= bytes 在末条目(起点 720)处 720+80 > 768,
+    // 无条件丢掉最后一个物理核;新准入只看 8 字节头,末核必须在场。
+    std::vector<unsigned char> buf;
+    for (unsigned i = 0; i < 8; ++i) {          // 8 个 SMT 对:LP {2i, 2i+1},eff 0
+        const std::vector<unsigned char> e = CoreExEntry(0x3ull << (2 * i), 0);
+        buf.insert(buf.end(), e.begin(), e.end());
+    }
+    for (unsigned i = 0; i < 8; ++i) {          // 8 个单线程核:LP 16..23,eff 1
+        const std::vector<unsigned char> e = CoreExEntry(1ull << (16 + i), 1);
+        buf.insert(buf.end(), e.begin(), e.end());
+    }
+    Expect(buf.size() == 768, "synthetic buffer is 16 entries x 48 bytes");
+    std::vector<pd::CoreInfo> cores;
+    Expect(pd::ParseCoreTopology(buf.data(), (unsigned long)buf.size(), cores),
+           "16-entry buffer parses");
+    Expect(cores.size() == 16,
+           "last entry admitted (old sizeof(EX) bound dropped it -> 15)");
+    if (cores.size() == 16) {
+        Expect(cores[0].repLP == 0 && cores[0].threads.size() == 2 &&
+               cores[0].threads[0] == 0 && cores[0].threads[1] == 1 &&
+               cores[0].effClass == 0, "first SMT pair {0,1} eff 0");
+        Expect(cores[7].repLP == 14 && cores[7].threads.size() == 2 &&
+               cores[7].threads[0] == 14 && cores[7].threads[1] == 15,
+               "last SMT pair {14,15}");
+        Expect(cores[15].repLP == 23 && cores[15].threads.size() == 1 &&
+               cores[15].threads[0] == 23 && cores[15].effClass == 1,
+               "final single-thread E-core entry survives (regression)");
+    }
+    {   // 跨组拒绝:GroupCount=2(条目 64 字节)与 mask 落在非 0 组。
+        std::vector<unsigned char> b = CoreExEntry(0x3, 0, 2, 0, 64);
+        std::vector<pd::CoreInfo> c;
+        Expect(!pd::ParseCoreTopology(b.data(), (unsigned long)b.size(), c),
+               "GroupCount != 1 rejected");
+    }
+    {
+        std::vector<unsigned char> b = CoreExEntry(0x3, 0, 1, 1);
+        std::vector<pd::CoreInfo> c;
+        Expect(!pd::ParseCoreTopology(b.data(), (unsigned long)b.size(), c),
+               "non-zero group rejected");
+    }
+    {   // 破损条目:Size=0(步进死循环防线)与 Size 越过缓冲尾。
+        std::vector<unsigned char> b = CoreExEntry(0x1, 0, 1, 0, 0);
+        std::vector<pd::CoreInfo> c;
+        Expect(!pd::ParseCoreTopology(b.data(), (unsigned long)b.size(), c),
+               "Size=0 entry rejected");
+    }
+    {
+        std::vector<unsigned char> b = CoreExEntry(0x1, 0);
+        const std::vector<unsigned char> second = CoreExEntry(0x2, 0);
+        b.insert(b.end(), second.begin(), second.begin() + 40);  // 只剩 40 字节
+        std::vector<pd::CoreInfo> c;
+        Expect(!pd::ParseCoreTopology(b.data(), (unsigned long)b.size(), c),
+               "entry overrunning buffer rejected");
+    }
+}
+
 // ---------- v3 SensorTable / CSV ----------
 void TestSensorTableBasics() {
     pd::SensorTable t;
@@ -955,6 +1046,7 @@ int main() {
     TestNtUsageSourceInstantiates();
     TestCalibrateTscHzPlausible();
     TestCoreInfoFallback();
+    TestParseCoreTopology();
     TestSensorTableBasics();
     TestFormatSensorCell();
     TestCsvV3HeaderAndRow();

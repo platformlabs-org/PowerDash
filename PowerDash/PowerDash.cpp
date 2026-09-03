@@ -3,6 +3,7 @@
 #include "PowerDashUi.h"
 #include "PowerDashProbe.h"
 #include "PowerDashSampler.h"
+#include "PowerDashUsage.h"   // pd::ParseCoreTopology(QueryCoreTopologyV2 用)
 #include "PowerDashIoctl.h"
 #include <iostream>
 #include <cstdint>
@@ -169,13 +170,14 @@ static unsigned CpuFamily() {
 }
 
 /* V2 物理核拓扑(v3 Task 3):GetLogicalProcessorInformationEx(
- * RelationProcessorCore)每条目恰为一个物理核,PROCESSOR_RELATIONSHIP 额外
- * 给出 EfficiencyClass(hybrid 性能/能效分级)与 GroupMask[](该核全部
- * SMT 兄弟)。LP 号 = 组内 mask 位序;单组机器即全机平铺编号。跨组机器
- * (GroupCount>1 或 mask 落在非 0 组)需按组基址换算编号,本版直接返回
- * false,调用方退回"cores 空 = 全 LP"保底。repLP = threads 最小值
- * (mask 最低置位位;Windows SMT 兄弟编号相邻,8C/16T 为 {0,1}{2,3}…,
- * 代表集 = {0,2,4,6,8,10,12,14},详见 PowerDashModel.h CoreInfo 注释)。 */
+ * RelationProcessorCore)每条目恰为一个物理核(含 EfficiencyClass 与该核
+ * 全部 SMT 兄弟 GroupMask)。缓冲解析在 pd::ParseCoreTopology
+ * (PowerDashUsage.cpp,单测覆盖):条目变长,准入按 8 字节头、步进按
+ * e->Size —— 核条目仅 48 字节而 sizeof(EX)=80(union 最大),用 sizeof
+ * 准入会丢最后一个核。跨组(GroupCount != 1 / 非 0 组)→ false,调用方
+ * 退回"cores 空 = 全 LP"保底。repLP = threads 最小值(Windows SMT 兄弟
+ * 编号相邻,8C/16T 为 {0,1}{2,3}…,代表集 = {0,2,4,6,8,10,12,14},
+ * 详见 PowerDashModel.h CoreInfo 注释)。 */
 static bool QueryCoreTopologyV2(std::vector<pd::CoreInfo>& cores) {
     cores.clear();
     DWORD bytes = 0;
@@ -190,32 +192,7 @@ static bool QueryCoreTopologyV2(std::vector<pd::CoreInfo>& cores) {
                 buf.data()),
             &bytes))
         return false;
-    for (DWORD off = 0; off + sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)
-                         <= bytes; ) {
-        auto* e = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(
-            buf.data() + off);
-        if (e->Relationship != RelationProcessorCore) {
-            if (e->Size == 0) break;
-            off += e->Size;
-            continue;
-        }
-        const PROCESSOR_RELATIONSHIP& r = e->Processor;
-        pd::CoreInfo ci;
-        ci.effClass = r.EfficiencyClass;   // 仅 RelationProcessorCore 有效
-        for (WORD g = 0; g < r.GroupCount; ++g) {
-            if (r.GroupMask[g].Group != 0) return false;   // 跨组:不支持
-            const KAFFINITY mask = r.GroupMask[g].Mask;
-            for (unsigned bit = 0; bit < 64; ++bit)
-                if (mask & ((KAFFINITY)1 << bit))
-                    ci.threads.push_back(bit);
-        }
-        if (ci.threads.empty()) return false;
-        ci.repLP = *std::min_element(ci.threads.begin(), ci.threads.end());
-        cores.push_back(std::move(ci));
-        if (e->Size == 0) break;
-        off += e->Size;
-    }
-    return !cores.empty();
+    return pd::ParseCoreTopology(buf.data(), bytes, cores);
 }
 
 struct PCICFG_Request {

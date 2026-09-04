@@ -72,8 +72,10 @@ bool WindowsDriverIo::ReadSmn(uint32_t smnAddr, uint32_t& out) {
 
 bool WindowsDriverIo::WriteSmn(uint32_t smnAddr, uint32_t value) {
     // 同 ReadSmn 形态但无回读:驱动侧在互斥内 Hal 写 0x60(地址)/0x64
-    // (数据)。注:0x64 数据口写经 pci.sys 被 Krackan 拒(实证),SMU
-    // 邮箱写入走用户态 ECAM(SmnEcam);本通道留作其他 SMN 域未来使用。
+    // (数据)。labs-tb16g7 实证:0x64 写回同值测试通过,机器稳定 ——
+    // 此前"写被拒"系 deviceControl 输出缓冲前置门 bug 误诊(55ba422
+    // 已修)。SMU 邮箱写入即走本通道(用户态 ECAM 绕道已删,结论留档
+    // 见 PowerDashPmTable.h)。
     SMN_Request req{};
     req.address = smnAddr;
     req.value = value;

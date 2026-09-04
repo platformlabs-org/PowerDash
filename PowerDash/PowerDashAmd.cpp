@@ -50,7 +50,7 @@ constexpr uint32_t AMD_CPPC_REQUEST = 0xC00102B3;       // 每核 CPPC 请求(EP
 constexpr uint32_t AMD_RO_APERF = 0xC00000E8, AMD_RO_MPERF = 0xC00000E7;
 // SMN THM_TCTL(ZEN_REPORTED_TEMP_CTRL_BASE,Linux k10temp.c:"Common for Zen
 // CPU families (Family 17h and 18h and 19h and 1Ah)";经驱动原子
-// IO_CTL_SMN_READ 读取,禁止用户态拆写 0xB8/0xBC)。
+// IO_CTL_SMN_READ 读取,禁止用户态拆写 0x60/0x64)。
 constexpr uint32_t SMN_THM_TCTL = 0x59800;
 // k10temp 解码:temp_mC = (raw >> 21) * 125;若 RANGE_SEL(bit19)=1 或
 // TJ_SEL([17:16])=0b11,再 -49 C(传感器量程扩展偏移)。tb16g7(family

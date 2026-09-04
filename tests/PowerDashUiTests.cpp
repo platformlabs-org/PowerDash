@@ -334,22 +334,20 @@ void TestModelDecompositionIdentities() {
 // v3 Task 4:FixtureDriverIo 换用 (core, msr) 静态值表(单核差异化;动态
 // 演进由测试在两拍之间改表模拟 —— 探针 ctor 读基线、测试 bump 后帧读差分)。
 // 保留 msrFailure/failAllMsrs;WriteSmn 记录 smnWrites(Task 1 契约),
-// smnReadHook 供 SMN 直读脚本(k10temp Tctl 走驱动路径);MapPhys 发放假
-// 物理内存(SMU 邮箱:ECAM 页/表页映射计数 + 表内 float;窗口访问经
-// SmnEcamAccessOverride 假寄存器堆,见 InstallSmuMailbox —— 邮箱不再触
-// physMem)。
+// smnReadHook/smnWriteHook 供 AMD 直读与 SMU 邮箱脚本(k10temp Tctl 直读、
+// 假固件寄存器堆,见 InstallSmuMailbox);MapPhys 发放假物理内存
+// (SMU PM 表页映射 + 表内 float)。
 class FixtureDriverIo : public pd::DriverIo {
 public:
     std::map<std::pair<unsigned, uint32_t>, uint64_t> msrPerCore;  // (core,msr)->值
     std::map<uint32_t, uint32_t> smn;                              // smn addr -> value
     std::map<uint32_t, uint32_t> smnWrites;                        // addr -> 最后写入值
-    std::function<uint32_t(uint32_t addr)> smnReadHook;            // 动态 SMN(直读脚本)
-    // 可选写钩子,在 smnWrites 记录**之前**调用;记录语义不变(仍存最后
-    // 写入值)。(SMU 邮箱测试已改假寄存器堆 + msgHook,不再用此钩子。)
+    std::function<uint32_t(uint32_t addr)> smnReadHook;            // 动态 SMN(邮箱轮询)
+    // Task 6:可选写钩子,在 smnWrites 记录**之前**调用(SMU 邮箱脚本需
+    // 观察 msg/arg 写入以驱动状态机);记录语义不变(仍存最后写入值)。
     std::function<void(uint32_t addr, uint32_t value)> smnWriteHook;
-    std::vector<uint8_t> physMem;                                  // 假物理内存(表页 + 映射计数)
+    std::vector<uint8_t> physMem;                                  // 假物理内存
     uint64_t mapPhysBase = 0;
-    unsigned mapCount = 0;                                         // MapPhys 成功次数
     // 可选:按 (core, msr) 脚本化读取失败(单核单次注入用)。真实硬件的
     // 计数器在读取失败期间照常前进,故钩子需自行推进 fixture 计数器。
     std::function<bool(unsigned core, uint32_t msr)> msrFailure;
@@ -375,7 +373,7 @@ public:
     }
     bool MapPhys(uint64_t phys, size_t len, void*& virt) override {
         if (physMem.size() < len) return false;
-        mapPhysBase = phys; ++mapCount; virt = physMem.data(); return true;  // 页内偏移 0(测试构造保证)
+        mapPhysBase = phys; virt = physMem.data(); return true;  // 页内偏移 0(测试构造保证)
     }
     void UnmapPhys(void*) override {}
 };
@@ -1393,50 +1391,41 @@ void TestAmdProbeWideTable() {
 }
 
 // ---- Task 6/10: SMU PSMU 邮箱 PMTable(协议单测 + AMD 探针接入)----
-// Task 10 架构(修正轮 1):邮箱寄存器是 SMN 地址(msg 0x3B10a20 / rep
-// 0x3B10a80 / args 0x3B10a88),客户端 SmuMsg 的一切读写逐条经
-// SmnEcam::Read/Write,即实机同一条 0xB8 闩地址 / 0xBC 数据单窗路径 ——
-// 无 ECAM 页偏移捷径(页偏移读的是无关配置寄存器,实机必错)。
-//   FakeSmnRegs 经 pd::SmnEcamAccessOverride 扮演 SMN 窗后端:假寄存器堆
-//   (map smnAddr->value;窗口写 = 存值并记录 (addr,value),窗口读 = 查值,
-//   未写地址读 0)—— Read/Write 可替换后端的最小扰动形态(SmuMsgHookDefault
-//   同纪律:测试拿不到 SmuPmTable 内部按值的 SmnEcam);
-//   假固件(pd::SmuMsgHookDefault,即内部对象的 msgHook)在 msg 写入后
-//   把 response/应答 args 写进同一寄存器堆 —— 客户端轮询/回读经窗口看见,
-//   不经钩子取值;钩子只扮演固件;
+// 邮箱寄存器是 SMN 地址(msg 0x3B10a20 / rep 0x3B10a80 / args 0x3B10a88),
+// 客户端 SmuMsg 的一切读写逐条经 DriverIo::ReadSmn/WriteSmn(驱动
+// IO_CTL_SMN_READ/WRITE,Hal 0x60/0x64 窗,读与写均实证可用)。
+//   FakeSmnRegs 假寄存器堆(addr->value),由 fixture 钩子驱动:
+//   写钩子(smnWriteHook,smnWrites 记录**之前**触发)= 客户端写路径:
+//     写入即存堆 + 序贯记录 (addr,value);msg 寄存器(kSmnMsg)写入
+//     即"发出消息" —— 假固件把 response 写进堆的 kSmnRep、应答 args
+//     写进 kSmnArgs+4*i(客户端随后的 ReadSmn 轮询/回读看见,不经钩子
+//     取值;钩子只扮演固件);
+//   读钩子(smnReadHook)= 客户端读路径:查堆(未写地址读 0,与实机
+//     SMN 读语义同);k10temp Tctl(0x59800)与邮箱共用此堆,测试向堆
+//     播种即服务驱动直读路径;
 //   rejectTransfer:接下来 N 次 0x65 的 response 给 0x80(前置拒绝),
 //   驱动 Refresh 的 Sleep(10) 重试一次分支;
-//   tctl 仍走驱动路径 io.ReadSmn(smnReadHook,0x59800 k10temp 直通);
-//   physMem 只支撑 Locate/MapPhys(ECAM 页 + PM 表页映射计数)与表内
-//   float —— 邮箱访问全被 override 接管后 ECAM 页保持原样(单测据此
-//   断言无页捷径)。
-constexpr uint64_t kFakeEcamPhys = 0xE0000000ull;   // 假 MCFG segment0/bus0 条目基址
+//   dead:应答永 0(轮询超时)—— 脚本引用捕获,逐拍可切;
+//   physMem 只支撑 PM 表页映射(SMU 指示的表地址)+ 表内 float。
 
 struct SmuMailboxScript {
-    uint32_t lastMsg = 0, tctlRaw = 0;
-    bool serveTctl = false;
+    uint32_t lastMsg = 0;
     unsigned rejectTransfer = 0;
     bool transferRejected = false;
     bool dead = false;              // 应答永 0(轮询超时)—— 引用捕获,逐拍可切
-    // msg 0x6 的 response 覆写(默认 0x1 与 Task 6 行为一致;
-    // 0xFE = 固件报未知命令,供 Diagnose 的 step4 脚本)。
+    // msg 0x6 的 response 覆写(默认 0x1;0xFE = 固件报未知命令,
+    // 供 Diagnose 的 step4 脚本)。
     uint32_t versionRep = 0x1u;
 };
 
-// 假 SMN 寄存器堆(SmnEcam 窗口后端):窗口写存值并精确记录 (addr,value)
-// (断言"寄存器堆收到期望地址上的期望写"用),窗口读取值(未写地址 0)。
+// 假 SMN 寄存器堆:客户端写存值并序贯记录 (addr,value)(断言"寄存器堆
+// 收到期望地址上的期望写"用),客户端读取值(未写地址 0)。
 struct FakeSmnRegs {
     std::map<uint32_t, uint32_t> regs;                  // smnAddr -> value
-    std::vector<std::pair<uint32_t, uint32_t>> writes;  // 客户端窗口写序贯记录
-    bool Access(bool write, uint32_t addr, uint32_t& v) {
-        if (write) {
-            regs[addr] = v;
-            writes.emplace_back(addr, v);
-            return true;
-        }
-        const auto it = regs.find(addr);
-        v = it == regs.end() ? 0u : it->second;
-        return true;
+    std::vector<std::pair<uint32_t, uint32_t>> writes;  // 客户端写序贯记录
+    void Store(uint32_t addr, uint32_t v) {
+        regs[addr] = v;
+        writes.emplace_back(addr, v);
     }
     // 精确 (addr,value) 写是否发生过(自检 0x47 -> 0x3B10a88 等)。
     bool Wrote(uint32_t addr, uint32_t value) const {
@@ -1447,18 +1436,14 @@ struct FakeSmnRegs {
 };
 
 void InstallSmuMailbox(FixtureDriverIo& io, SmuMailboxScript& st, FakeSmnRegs& regs) {
-    // (1) SmnEcam 窗口后端替换:0xB8/0xBC 单窗访问改道假寄存器堆 —— 客户端
-    //     一切邮箱寄存器访问(msg/rep/args)与实机同路径经 SmnEcam::Read/Write。
-    pd::SmnEcamAccessOverride = [&regs](bool w, uint32_t a, uint32_t& v) {
-        return regs.Access(w, a, v);
-    };
-    // (2) 假固件:msg 寄存器写入后把 response/应答 args 写进同一寄存器堆
-    //     (直写 regs,不经 Access —— 固件不是窗口客户端,writes 只记客户端)。
-    pd::SmuMsgHookDefault = [&st, &regs](uint32_t msg, uint32_t(&)[6]) {
-        if (st.dead) return;                     // 失联:应答永不出现(rep 已被清 0)
-        st.lastMsg = msg;
+    // (1) 写钩子 = 客户端写路径(先入堆,再演固件;发生在 fixture 记录
+    //     smnWrites 之前,与实机"写 msg 触发固件"同一时序)。
+    io.smnWriteHook = [&](uint32_t a, uint32_t v) {
+        regs.Store(a, v);
+        if (a != pd::SmuPmTable::kSmnMsg || st.dead) return;  // 失联:应答不出现
+        st.lastMsg = v;
         uint32_t rep = 0x1u;
-        if (msg == 0x65u) {                        // transfer 前置拒绝脚本
+        if (v == 0x65u) {                        // transfer 前置拒绝脚本
             if (st.rejectTransfer > 0) {
                 --st.rejectTransfer;
                 st.transferRejected = true;
@@ -1467,62 +1452,24 @@ void InstallSmuMailbox(FixtureDriverIo& io, SmuMailboxScript& st, FakeSmnRegs& r
                 st.transferRejected = false;
             }
         }
-        if (msg == 0x6u) rep = st.versionRep;
-        regs.regs[pd::SmuPmTable::kSmnRep] = rep;          // 应答 response(窗口轮询可见)
+        if (v == 0x6u) rep = st.versionRep;
+        regs.regs[pd::SmuPmTable::kSmnRep] = rep;          // 应答 response(轮询可见)
         uint32_t resp[6] = {};
-        if (msg == 0x6u) resp[0] = 0x00650005u;            // Krackan 表版本
-        if (msg == 0x66u) { resp[0] = 0x1000u; resp[1] = 0u; }  // 表物理地址
+        if (v == 0x6u) resp[0] = 0x00650005u;            // Krackan 表版本
+        if (v == 0x66u) { resp[0] = 0x1000u; resp[1] = 0u; }  // 表物理地址
         for (uint32_t i = 0; i < 6; ++i)
-            regs.regs[pd::SmuPmTable::kSmnArgs + 4u * i] = resp[i];  // 窗口回读可见
+            regs.regs[pd::SmuPmTable::kSmnArgs + 4u * i] = resp[i];  // 回读可见
     };
-    io.smnReadHook = [&st](uint32_t a) -> uint32_t {  // 驱动路径:k10temp 直读
-        if (st.serveTctl && a == 0x59800u) return st.tctlRaw;
-        return 0u;
+    // (2) 读钩子 = 客户端读路径:查假寄存器堆。
+    io.smnReadHook = [&](uint32_t a) -> uint32_t {
+        const auto it = regs.regs.find(a);
+        return it == regs.regs.end() ? 0u : it->second;
     };
-}
-
-// MCFG 纯解析单测(SmnEcam::Locate 的解析半部;抓取半部读真固件,经
-// SmnEcamLocateOverride 在其余 SMU 测试注入固定基址)。
-void TestSmnEcamParseMcfg() {
-    // 36 字节 ACPI 头('MCFG' 签名 + Length@+4)+ 2 条 16 字目条目。
-    uint8_t tbl[36 + 2 * 16] = {};
-    std::memcpy(tbl, "MCFG", 4);
-    const uint32_t len = static_cast<uint32_t>(sizeof(tbl));
-    std::memcpy(tbl + 4, &len, 4);
-    auto entry = [&](size_t i) { return tbl + 36 + i * 16; };
-    uint64_t bSeg1 = 0xE0000000ull;                       // 条目 0:非 0 段(跳过)
-    std::memcpy(entry(0), &bSeg1, 8);
-    uint16_t seg1 = 1;
-    std::memcpy(entry(0) + 8, &seg1, 2);
-    entry(0)[10] = 0; entry(0)[11] = 0xFF;
-    uint64_t bSeg0 = 0xB0000000ull;                       // 条目 1:segment 0,bus 0..255
-    std::memcpy(entry(1), &bSeg0, 8);
-    uint16_t seg0 = 0;
-    std::memcpy(entry(1) + 8, &seg0, 2);
-    entry(1)[10] = 0; entry(1)[11] = 0xFF;
-    uint64_t base = 0;
-    Expect(pd::SmnEcam::ParseMcfg(tbl, sizeof(tbl), base) && base == 0xB0000000ull,
-           "ParseMcfg picks the segment-0 bus-0 entry base");
-    entry(1)[10] = 1;                                     // StartBus=1:不覆盖 bus 0
-    Expect(!pd::SmnEcam::ParseMcfg(tbl, sizeof(tbl), base),
-           "no bus-0-covering segment-0 entry is rejected");
-    entry(1)[10] = 0;
-    const uint32_t badLen = len - 16;
-    std::memcpy(tbl + 4, &badLen, 4);                     // 头 Length 与缓冲不符
-    Expect(!pd::SmnEcam::ParseMcfg(tbl, sizeof(tbl), base),
-           "header length mismatch is rejected");
-    std::memcpy(tbl + 4, &len, 4);
-    Expect(!pd::SmnEcam::ParseMcfg(tbl, 35, base), "truncated header rejected");
-    Expect(!pd::SmnEcam::ParseMcfg(tbl, 44, base), "truncated entry rejected");
-    Expect(!pd::SmnEcam::ParseMcfg(tbl + 1, sizeof(tbl) - 1, base),
-           "bad signature rejected");
 }
 
 void TestSmuPmTableProtocol() {
     FixtureDriverIo io;
-    io.physMem.assign(0x2000, 0);   // 假物理内存:ECAM 页 + 表页(地址 0x1000)
-    pd::SmnEcamLocateOverride =
-        [](uint64_t& b) { b = kFakeEcamPhys; return true; };
+    io.physMem.assign(0x2000, 0);   // 假物理内存(PM 表页,表地址 0x1000)
     auto putf = [&](uint32_t off, float v) {
         std::memcpy(io.physMem.data() + off, &v, 4);
     };
@@ -1535,26 +1482,23 @@ void TestSmuPmTableProtocol() {
     auto pm = pd::SmuPmTable::TryCreate(io);
     Expect(pm != nullptr, "SMU handshake succeeds");
     Expect(pm->version() == 0x00650005u,
-           "version from msg 0x6 (args read back through the window)");
+           "version from msg 0x6 (args read back via ReadSmn)");
     Expect(pm->addr() == 0x1000ull,
            "table address from msg 0x66 (arg1<<32|arg0)");
-    Expect(io.mapCount == 2,
-           "exactly two maps: ECAM page + table page");
-    // 窗口写精确落址(寄存器是 SMN 地址,逐条经 0xB8/0xBC 单窗):
-    // 自检魔数 0x47 -> kSmnArgs;每条消息先清 kSmnRep;transfer 0x65 ->
-    // kSmnMsg。这正是"无 ECAM 页偏移捷径"的行为学证据(页偏移写会落
-    // 在 0xA88/0xA80 等无关地址上)。
+    // 邮箱写精确落址(寄存器是完整 SMN 地址,逐条经 DriverIo::WriteSmn):
+    // 自检魔数 0x47 -> kSmnArgs(0x3B10a88);每条消息先清 kSmnRep
+    // (0x3B10a80);transfer 0x65 -> kSmnMsg(0x3B10a20)。
     Expect(regs.Wrote(pd::SmuPmTable::kSmnArgs, 0x47u),
            "self-test magic 0x47 written to the exact kSmnArgs SMN address");
     Expect(regs.Wrote(pd::SmuPmTable::kSmnRep, 0u),
            "response register cleared at the exact kSmnRep SMN address");
     Expect(regs.Wrote(pd::SmuPmTable::kSmnMsg, 0x65u),
            "transfer 0x65 written to the exact kSmnMsg SMN address");
-    // 每次窗口写的目标都是完整 SMN 地址(邮箱寄存器群 0x3B10a2x-0x3B10a9c),
-    // 绝无裸页偏移(0xA20/0xA80/0xA88 之类)—— 页捷径若存在必在此现形。
-    for (const auto& w : regs.writes)
-        Expect(w.first >= 0x3B10A20u,
-               "window writes use full SMN addresses, never bare page offsets");
+    // 驱动通道契约:邮箱写都流经 io.WriteSmn(smnWrites 记最后写入值,
+    // 即 Task-6 驱动 IO_CTL_SMN_WRITE 路径的行为学证据;0x47 自检写
+    // 的精确证据在上方 regs.Wrote —— 后续消息清 args 会覆盖该地址)。
+    Expect(io.smnWrites[pd::SmuPmTable::kSmnMsg] == 0x65u,
+           "mailbox writes flow through DriverIo::WriteSmn (smnWrites)");
     Expect(pm->At(0x04) == 15.5f, "float read at offset");
     Expect(std::isnan(pm->At(0x1000u)), "offset past the window reads NaN");
     Expect(std::isnan(pm->At(0xFFDu)), "3-byte-tail offset reads NaN");
@@ -1568,32 +1512,16 @@ void TestSmuPmTableProtocol() {
     putf(0x04, 16.5f);       // At 跟随假物理内存演进
     Expect(pm->Refresh() && pm->At(0x04) == 16.5f,
            "At follows physMem after refresh");
-    // 全协议交换后 ECAM 页原样(0xB8/0xBC 窗口区、0xA80..0xA9F rep/args
-    // 页偏移区均未被碰)—— 邮箱访问全经假寄存器堆,无页捷径。
-    {
-        const uint8_t* p = io.physMem.data();
-        bool touched = false;
-        for (uint32_t off = 0xB8u; off < 0xC0u; ++off) touched |= p[off] != 0;
-        for (uint32_t off = 0xA80u; off < 0xAA0u; ++off) touched |= p[off] != 0;
-        Expect(!touched, "mailbox traffic never touches the ECAM page offsets");
-    }
-    pd::SmuMsgHookDefault = nullptr;          // 用毕即还原(钩子捕获局部)
-    pd::SmnEcamAccessOverride = nullptr;
-    pd::SmnEcamLocateOverride = nullptr;
 }
 
 // ---- Task 10: --pmdump 握手逐步诊断 SmuPmTable::Diagnose ----
 // 复用 Task 6 邮箱脚本:版本消息 0x6 应答 0xFE(未知命令)-> Diagnose 停在
 // step4 并记录 versionRep;健康邮箱 -> failedStep=0 全字段记录且从不映射
-// PM 表页(仅邮箱自身必需的 ECAM 页:mapCount==1 且基址 = 假 MCFG 条目,
-// 若误映射表页会留下第二次 MapPhys 痕迹)。
+// (fixture 不放物理内存,若误调 MapPhys 会留下 mapPhysBase 痕迹)。
 void TestSmuHandshakeDiagnose() {
-    pd::SmnEcamLocateOverride =
-        [](uint64_t& b) { b = kFakeEcamPhys; return true; };
     // 场景 1:版本消息 0xFE(Krackan 排障主脚本:固件不识消息号)。
     {
         FixtureDriverIo io;
-        io.physMem.assign(0x1000, 0);   // 仅 ECAM 页(诊断不映射表页)
         SmuMailboxScript st;
         FakeSmnRegs regs;
         st.versionRep = 0xFEu;
@@ -1617,11 +1545,10 @@ void TestSmuHandshakeDiagnose() {
         Expect(pd::SmuPmTable::TryCreate(io) == nullptr,
                "same 0xFE fixture: TryCreate still fails (version step)");
     }
-    // 场景 2:健康邮箱全绿;只映射 ECAM 页(mapCount==1 证明 PM 表页
-    // 从未被映射)。
+    // 场景 2:健康邮箱全绿;不映射(fixture 无 physMem,MapPhys 必失败,
+    // mapPhysBase 仍 0 即证明诊断从未尝试映射)。
     {
         FixtureDriverIo io;
-        io.physMem.assign(0x1000, 0);
         SmuMailboxScript st;
         FakeSmnRegs regs;
         InstallSmuMailbox(io, st, regs);
@@ -1636,23 +1563,8 @@ void TestSmuHandshakeDiagnose() {
                "diag records the table address from msg 0x66");
         Expect(tr.transferRep == 0x1u,
                "diag step8 single 0x65 transfer response recorded");
-        Expect(io.mapPhysBase == kFakeEcamPhys && io.mapCount == 1,
-               "diag maps only the ECAM page, never the PM table page");
+        Expect(io.mapPhysBase == 0ull, "diag never maps physical memory");
     }
-    // 场景 3:ECAM 定位失败(MCFG 无/不可用)-> step1(写自检无从发生)。
-    {
-        FixtureDriverIo io;
-        pd::SmnEcamLocateOverride = [](uint64_t&) { return false; };
-        const pd::SmuHandshakeTrace tr = pd::SmuPmTable::Diagnose(io);
-        Expect(tr.failedStep == 1,
-               "diag reports step1 when ECAM locate/map fails");
-        Expect(io.mapCount == 0, "nothing is mapped when locate fails");
-        pd::SmnEcamLocateOverride =
-            [](uint64_t& b) { b = kFakeEcamPhys; return true; };
-    }
-    pd::SmuMsgHookDefault = nullptr;          // 用毕即还原(钩子捕获局部)
-    pd::SmnEcamAccessOverride = nullptr;
-    pd::SmnEcamLocateOverride = nullptr;
 }
 
 void TestAmdProbePmTable() {
@@ -1662,8 +1574,6 @@ void TestAmdProbePmTable() {
     io.msrPerCore[{0, 0xC0010299}] = 16ull << 8;    // energy bits 16
     io.msrPerCore[{0, 0xC001029B}] = 0;             // pkg 能量基线 0
     io.physMem.assign(0x2000, 0);
-    pd::SmnEcamLocateOverride =
-        [](uint64_t& b) { b = kFakeEcamPhys; return true; };
     auto putf = [&](uint32_t off, float v) {
         std::memcpy(io.physMem.data() + off, &v, 4);
     };
@@ -1675,8 +1585,8 @@ void TestAmdProbePmTable() {
     putf(0x40, 100.0f); putf(0x44, 55.25f); // Tctl 限值/实际
     SmuMailboxScript st;
     FakeSmnRegs regs;
-    st.serveTctl = true; st.tctlRaw = 0x510B0000u;  // k10temp -> 32.0 °C
     InstallSmuMailbox(io, st, regs);
+    regs.regs[0x59800] = 0x510B0000u;   // k10temp 直读路径:假堆播种 -> 32.0 °C
     pd::TscCalibrationOverride = [] { return 0.0; };
     pd::PlatformInfo info;
     info.vendor = pd::Vendor::Amd;
@@ -1783,17 +1693,17 @@ void TestAmdProbePmTable() {
                std::abs(tb.Lookup("pm.tdc.value").value - 42.5) < 1e-6,
            "PM columns recover after the mailbox comes back");
 
-    // 失败臂:ECAM 定位失败(无 MCFG)-> TryCreate nullptr ->
+    // 失败臂:SMN 读恒 0(arg0 自检回读失败)-> TryCreate nullptr ->
     // 无 PM 列、powerLimits 关、帧仍成立、Sample 字段 NA
     FixtureDriverIo io2;
     io2.msrPerCore[{0, 0xC0010299}] = 16ull << 8;
     io2.msrPerCore[{0, 0xC001029B}] = 0;
-    pd::SmnEcamLocateOverride = [](uint64_t&) { return false; };
+    io2.smnReadHook = [](uint32_t) { return 0u; };
     auto probe2 = pd::CreateAmdProbe(io2, info);
     pd::SensorTable* t2 = probe2->sensors();
     Expect(t2->Find("pm.stapm.value") < 0 && t2->Find("pm.tdc.value") < 0 &&
                t2->Find("pct.tdc") < 0,
-           "no PM columns when the ECAM/SMU init fails");
+           "no PM columns when the handshake fails");
     Expect(!probe2->caps().powerLimits, "powerLimits caps stays off");
     io2.msrPerCore[{0, 0xC001029B}] = 65536;
     pd::Sample s5;
@@ -1801,9 +1711,6 @@ void TestAmdProbePmTable() {
            "frame still succeeds without PM (power fuse unrelated)");
     Expect(!s5.powerLimit.sustainedW.valid && !s5.currentLimit.tdcA.valid,
            "PM Sample fields stay NA without the handshake");
-    pd::SmuMsgHookDefault = nullptr;          // 用毕即还原(钩子捕获局部)
-    pd::SmnEcamAccessOverride = nullptr;
-    pd::SmnEcamLocateOverride = nullptr;
 }
 
 // tsc 校准失败(tscHz=0)守卫:eff 列 NA(ΔAPERF 差分存在也不得发
@@ -2104,7 +2011,6 @@ int main() {
     TestAmdProbeTempRangeOffset();
     TestAmdProbePstateBaseClock();
     TestAmdProbeWideTable();
-    TestSmnEcamParseMcfg();
     TestSmuPmTableProtocol();
     TestSmuHandshakeDiagnose();
     TestAmdProbePmTable();

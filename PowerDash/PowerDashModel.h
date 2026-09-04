@@ -64,7 +64,10 @@ struct CoreInfo {                   // 单个物理核拓扑(v3:Ex API 全量)
                                     // = {0,2,4,6,8,10,12,14} —— "取前 nCores
                                     // 个 LP"只会读一半核各两遍,代表集必须
                                     // 来自实际 mask)
-    unsigned effClass = 0;          // EfficiencyClass:0=性能核;1/2=能效核(分级)
+    unsigned effClass = 0;          // EfficiencyClass:实测(2026-09,ARL-H
+                                    // CPUID 0x1A + Krackan 5050MHz 交叉验证)
+                                    // 1=性能核、0=能效核;≥2 仅 LNL 式 3 类
+                                    // SKU 理论出现,未实测
 };
 
 struct PlatformInfo {            // CPUID 静态信息,入口层计算后交给工厂

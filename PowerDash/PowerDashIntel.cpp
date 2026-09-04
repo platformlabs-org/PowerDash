@@ -88,16 +88,24 @@ constexpr struct { uint32_t msr; const char* key; const char* name; }
         {MSR_PKG_C10_RESIDENCY, "pkgres.c10", "Package C10 Residency [%]"},
     };
 
-// HWiNFO 核名:effClass 0→"P-core n"、1→"E-core n"、≥2→"E-core (LP) n",
-// 编号 = 顺序核索引(cores_ 向量 0 基位置;spec §1.1 命名约定)。与 AMD
-// 探针统一口径,依据实测 amd.CSV(Krackan Point 8C/16T)核列为
-// "Zen5 Core 0/Zen5c Core 1/…" 顺序物理核索引 —— repLP 取号在 SMT 机上
-// 会跳号(0/2/4/…),与 HWiNFO 不符;LNL 1T/核下 index==repLP,数值不变。
+// HWiNFO 核名:effClass 1→"P-core n"、0→"E-core n"、≥2→"E-core (LP) n",
+// 编号 = 顺序核索引(cores_ 向量 0 基位置;spec §1.1 命名约定)。
+// 实测口径(2026-09 两台实机取证,测量优先于文档直觉):
+//   - 开发机 ARL-H Ultra 7 255H(6P+8E+2LP-E):GetLogicalProcessorInformationEx
+//     把 P 核 {LP 0,1,10,11,12,13} 打 class 1,E/LP-E {2..9,14,15} 打 class 0;
+//     与 CPUID leaf 0x1A native model 交叉核对一致(0x40 = 上述 6 个 P 核,
+//     0x20 = 10 个 E/LP 核)。
+//   - AMD Krackan 同式(5050 MHz 真 Zen5 核 class 1、3080 MHz Zen5c class 0),
+//     两平台一致指向 1=性能核 —— 经典文档直觉虽是 0=性能,实测为准。
+//   - ≥2 → "E-core (LP)" 仅为 LNL 式 3 类 SKU 保留,本会话无实机可测,
+//     属已知局限。
+// repLP 取号在 SMT 机上会跳号(0/2/4/…),与 HWiNFO 不符;LNL 1T/核下
+// index==repLP,数值不变(与 AMD 探针统一口径)。
 std::string CoreName(const CoreInfo& c, size_t idx) {
     char buf[48];
-    if (c.effClass == 0)
+    if (c.effClass == 1)
         snprintf(buf, sizeof(buf), "P-core %u", (unsigned)idx);
-    else if (c.effClass == 1)
+    else if (c.effClass == 0)
         snprintf(buf, sizeof(buf), "E-core %u", (unsigned)idx);
     else
         snprintf(buf, sizeof(buf), "E-core (LP) %u", (unsigned)idx);
@@ -531,7 +539,7 @@ private:
     }
 
     // 拓扑规范化:cores 空/repLP 或线程 LP 越界 = 拓扑未知,退回
-    // "每 LP 一个单线程核"(全部 effClass 0,P-core 命名)—— 保底覆盖
+    // "每 LP 一个单线程核"(全部 effClass 0,E-core 命名)—— 保底覆盖
     // 全部 LP,与 v2 全 LP 遍历语义一致(见 PowerDashModel.h cores 注释)。
     void NormalizeTopology(const PlatformInfo& info) {
         nLP_ = info.logicalProcessors;

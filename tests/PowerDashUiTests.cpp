@@ -523,7 +523,7 @@ void TestIntelProbeWideTable() {
     pd::PlatformInfo info;
     info.vendor = pd::Vendor::Intel;
     info.logicalProcessors = 2;
-    info.cores = { {0, {0}, 0}, {1, {1}, 1} };   // P0 + E1(核名区分 effClass)
+    info.cores = { {0, {0}, 0}, {1, {1}, 1} };   // E0 + P1(核名区分 effClass)
     info.baseGHz = 0;
     const double tscHz = pd::CalibrateTscHz();   // 独立测 TSC,断言 bus 公式
     auto probe = pd::CreateIntelProbe(io, info);
@@ -536,16 +536,16 @@ void TestIntelProbeWideTable() {
            "energy domain ctor probes set caps honestly");
     Expect(probe->caps().residency, "residency caps when C-state columns exist");
 
-    // 列名 = HWiNFO 原文(effClass 0 -> "P-core n"、1 -> "E-core n",编号 = repLP)
+    // 列名 = HWiNFO 原文(effClass 1 -> "P-core n"、0 -> "E-core n",编号 = repLP)
     int i = -1;
     Expect((i = t->Find("clock.0")) >= 0 &&
-               t->Column(i).name == "P-core 0 Clock [MHz]",
-           "core 0 uses P-core naming");
+               t->Column(i).name == "E-core 0 Clock [MHz]",
+           "core 0 uses E-core naming");
     Expect((i = t->Find("clock.1")) >= 0 &&
-               t->Column(i).name == "E-core 1 Clock [MHz]",
-           "core 1 uses E-core naming");
+               t->Column(i).name == "P-core 1 Clock [MHz]",
+           "core 1 uses P-core naming");
     Expect((i = t->Find("cores.c0.lp1")) >= 0 &&
-               t->Column(i).name == "E-core 1 T0 C0 Residency [%]",
+               t->Column(i).name == "P-core 1 T0 C0 Residency [%]",
            "per-thread C0 uses HWiNFO T0 naming");
     Expect((i = t->Find("temp.pkg")) >= 0 &&
                t->Column(i).name == "CPU Package [°C]",
@@ -735,16 +735,49 @@ void TestIntelProbeCoreIndexNaming() {
     pd::PlatformInfo info;
     info.vendor = pd::Vendor::Intel;
     info.logicalProcessors = 8;
-    info.cores = { {0, {0, 1}, 0}, {5, {5}, 1} };   // repLP 0/5,索引 0/1
+    info.cores = { {0, {0, 1}, 0}, {5, {5}, 1} };   // repLP 0/5,索引 0/1(核 1 类 1)
     auto probe = pd::CreateIntelProbe(io, info);
     pd::SensorTable* t = probe->sensors();
     int i = -1;
     Expect((i = t->Find("clock.1")) >= 0 &&
-               t->Column(i).name == "E-core 1 Clock [MHz]",
+               t->Column(i).name == "P-core 1 Clock [MHz]",
            "intel core name uses sequential index (repLP 5 -> index 1)");
     Expect((i = t->Find("cores.c0.lp5")) >= 0 &&
-               t->Column(i).name == "E-core 1 T0 C0 Residency [%]",
+               t->Column(i).name == "P-core 1 T0 C0 Residency [%]",
            "intel per-thread column also uses sequential index");
+}
+
+// ---- Task 10: EfficiencyClass→核类实测口径钉住(防再次反转)----
+// 实测证据(2026-09 两台实机取证,测量优先于文档直觉):
+//   - Intel 开发机 ARL-H Ultra 7 255H(6P+8E+2LP-E):GetLogicalProcessor-
+//     InformationEx 给 P 核 {LP 0,1,10,11,12,13} 打 class 1,E/LP-E
+//     {2..9,14,15} 打 class 0;CPUID leaf 0x1A native model 交叉核对一致
+//     (0x40 = 6 个 P 核,0x20 = 10 个 E/LP 核)。
+//   - AMD Krackan:冲 5050 MHz 的真 Zen5 核携带 class 1,3080 MHz Zen5c
+//     携带 class 0(HWiNFO amd.CSV 把冲高偶数位核命名 "Zen5",与
+//     class 1 吻合)。
+// 经典文档直觉是 0=性能核,两台机器实测均为 1=性能核 —— 以测量为准。
+void TestIntelProbeCoreClassNaming() {
+    FixtureDriverIo io;
+    io.msrPerCore[{0, 0x606}] = 16ull << 8;
+    for (unsigned lp = 1; lp <= 3; ++lp)        // 三核 repLP 可读 -> 各有时钟列
+        io.msrPerCore[{lp, 0x198}] = 40ull << 8;
+    pd::PlatformInfo info;
+    info.vendor = pd::Vendor::Intel;
+    info.logicalProcessors = 4;
+    info.cores = { {1, {1}, 1}, {2, {2}, 0}, {3, {3}, 2} };   // 类 1/0/2
+    auto probe = pd::CreateIntelProbe(io, info);
+    pd::SensorTable* t = probe->sensors();
+    int i = -1;
+    Expect((i = t->Find("clock.0")) >= 0 &&
+               t->Column(i).name == "P-core 0 Clock [MHz]",
+           "effClass 1 names P-core (measured: ARL-H P cores carry class 1)");
+    Expect((i = t->Find("clock.1")) >= 0 &&
+               t->Column(i).name == "E-core 1 Clock [MHz]",
+           "effClass 0 names E-core (measured: E/LP-E cores carry class 0)");
+    Expect((i = t->Find("clock.2")) >= 0 &&
+               t->Column(i).name == "E-core (LP) 2 Clock [MHz]",
+           "effClass >= 2 keeps LP-E naming (LNL 3-class SKU, untested on hardware)");
 }
 
 // ---- Task 8: AmdProbe(保底监控集)----
@@ -1149,7 +1182,7 @@ void TestAmdProbeWideTable() {
     // 全 LP 拓扑,断言即失效 —— 本 CI 机 16 LP)。
     info.logicalProcessors = std::thread::hardware_concurrency();
     info.family = 0x1A;
-    info.cores = { {0, {0, 1}, 0}, {2, {2, 3}, 1} };   // Zen5(2T) + Zen5c(2T)
+    info.cores = { {0, {0, 1}, 0}, {2, {2, 3}, 1} };   // Zen5c(2T) + Zen5(2T)
     const double tscHz = pd::CalibrateTscHz();   // 独立测 TSC,断言 bus 公式
     auto probe = pd::CreateAmdProbe(io, info);
     pd::SensorTable* t = probe->sensors();
@@ -1161,22 +1194,22 @@ void TestAmdProbeWideTable() {
     // 功率列 = 纯 "Core %u Power" 核序号 —— amd.CSV 即如此)
     int i = -1;
     Expect((i = t->Find("vid.0")) >= 0 &&
-               t->Column(i).name == "Zen5 Core 0 VID [V]",
-           "core 0 uses Zen5 naming");
+               t->Column(i).name == "Zen5c Core 0 VID [V]",
+           "core 0 uses Zen5c naming");
     Expect((i = t->Find("clock.1")) >= 0 &&
-               t->Column(i).name == "Zen5c Core 1 Clock [MHz]",
-           "core 1 uses Zen5c naming by sequential index (repLP 2 -> 1)");
+               t->Column(i).name == "Zen5 Core 1 Clock [MHz]",
+           "core 1 uses Zen5 naming by sequential index (repLP 2 -> 1)");
     Expect((i = t->Find("eff.1.1")) >= 0 &&
-               t->Column(i).name == "Zen5c Core 1 T1 Effective Clock [MHz]",
+               t->Column(i).name == "Zen5 Core 1 T1 Effective Clock [MHz]",
            "per-thread effective clock uses HWiNFO T0/T1 naming");
     Expect((i = t->Find("usage.0.1")) >= 0 &&
-               t->Column(i).name == "Zen5 Core 0 T1 Usage [%]",
+               t->Column(i).name == "Zen5c Core 0 T1 Usage [%]",
            "per-thread usage column name");
     Expect((i = t->Find("util.1.0")) >= 0 &&
-               t->Column(i).name == "Zen5c Core 1 T0 Utility [%]",
+               t->Column(i).name == "Zen5 Core 1 T0 Utility [%]",
            "per-thread utility column name");
     Expect((i = t->Find("cores.c0.1")) >= 0 &&
-               t->Column(i).name == "Zen5c Core 1 C0 Residency [%]",
+               t->Column(i).name == "Zen5 Core 1 C0 Residency [%]",
            "per-core C0 residency column name");
     Expect((i = t->Find("temp.tctl")) >= 0 &&
                t->Column(i).name == "CPU (Tctl/Tdie) [°C]",
@@ -1358,8 +1391,8 @@ void TestAmdProbeWideTable() {
     Expect(c0.valid && std::abs(c0.value - c0Exp) < 0.10 * c0Exp,
            "cores.c0.0 = dMPERF/dTSC x 100");
 
-    // 拍 6:抽走 Zen5 COFVID/EPP -> 时钟/VID 列回 NA、均值只聚合 Zen5c,
-    // EPP 只聚合 Zen5c(51/2.55=20.0,区别于双核均值);能量照常帧仍成立
+    // 拍 6:抽走 Zen5c COFVID/EPP -> 时钟/VID 列回 NA、均值只聚合 Zen5,
+    // EPP 只聚合 Zen5(51/2.55=20.0,区别于双核均值);能量照常帧仍成立
     io.msrPerCore.erase({0, 0xC0010293});
     io.msrPerCore.erase({0, 0xC00102B3});
     io.msrPerCore[{2, 0xC00102B3}] = 51ull << 24;
@@ -1388,6 +1421,36 @@ void TestAmdProbeWideTable() {
     pd::Sample s7;
     Expect(!probe->readSample(s7), "all power domains absent fails the frame");
     Expect(!tb.Lookup("epp.avg").valid, "epp NA when no core is readable");
+}
+
+// ---- Task 10: AMD 侧 EfficiencyClass 实测口径钉住(防再次反转)----
+// 实测证据(2026-09 Krackan 实机取证):冲 5050 MHz 的核(真 Zen5)携带
+// class 1,3080 MHz 核(Zen5c)携带 class 0;HWiNFO amd.CSV 把冲高的偶数
+// 位核命名为 "Zen5",与 class 1 = Zen5 吻合。Intel 侧 ARL-H 255H CPUID
+// 0x1A 交叉核对同式(见 TestIntelProbeCoreClassNaming)—— 经典文档直觉
+// 虽是 0=性能,两台机器实测均为 1=性能,以测量为准。
+void TestAmdProbeCoreClassNaming() {
+    FixtureDriverIo io;
+    io.msrPerCore[{0, 0xC0010299}] = 16ull << 8;   // 能量单位可读
+    for (unsigned lp : {0u, 2u, 4u})               // 三核 repLP COFVID 可读
+        io.msrPerCore[{lp, 0xC0010293}] = 0x2BC;   // -> 各有 VID 列
+    pd::PlatformInfo info;
+    info.vendor = pd::Vendor::Amd;
+    info.logicalProcessors = 6;
+    info.family = 0x1A;
+    info.cores = { {2, {2}, 1}, {0, {0}, 0}, {4, {4}, 2} };   // 类 1/0/2
+    auto probe = pd::CreateAmdProbe(io, info);
+    pd::SensorTable* t = probe->sensors();
+    int i = -1;
+    Expect((i = t->Find("vid.0")) >= 0 &&
+               t->Column(i).name == "Zen5 Core 0 VID [V]",
+           "effClass 1 names Zen5 (measured: 5050 MHz cores carry class 1)");
+    Expect((i = t->Find("vid.1")) >= 0 &&
+               t->Column(i).name == "Zen5c Core 1 VID [V]",
+           "effClass 0 names Zen5c (measured: 3080 MHz cores carry class 0)");
+    Expect((i = t->Find("vid.2")) >= 0 &&
+               t->Column(i).name == "Core 2 VID [V]",
+           "effClass >= 2 falls back to plain Core naming");
 }
 
 // ---- Task 6/10: SMU PSMU 邮箱 PMTable(协议单测 + AMD 探针接入)----
@@ -1915,7 +1978,7 @@ void TestParseCoreTopology() {
                "last SMT pair {14,15}");
         Expect(cores[15].repLP == 23 && cores[15].threads.size() == 1 &&
                cores[15].threads[0] == 23 && cores[15].effClass == 1,
-               "final single-thread E-core entry survives (regression)");
+               "final single-thread P-core entry survives (regression)");
     }
     {   // 跨组拒绝:GroupCount=2(条目 64 字节)与 mask 落在非 0 组。
         std::vector<unsigned char> b = CoreExEntry(0x3, 0, 2, 0, 64);
@@ -2003,6 +2066,7 @@ int main() {
     TestIntelProbeEnergyWraparound();
     TestIntelProbeWideTable();
     TestIntelProbeCoreIndexNaming();
+    TestIntelProbeCoreClassNaming();
     TestAmdProbeReplay();
     TestAmdProbeEnergyWraparound();
     TestAmdProbeDegradesAndFuses();
@@ -2011,6 +2075,7 @@ int main() {
     TestAmdProbeTempRangeOffset();
     TestAmdProbePstateBaseClock();
     TestAmdProbeWideTable();
+    TestAmdProbeCoreClassNaming();
     TestSmuPmTableProtocol();
     TestSmuHandshakeDiagnose();
     TestAmdProbePmTable();

@@ -110,19 +110,24 @@ uint8_t DecodeEnergyBits(uint64_t unitRaw) {
     return static_cast<uint8_t>((unitRaw >> 8) & 0x1F);   // 同 Intel 位布局
 }
 
-// HWiNFO 核名(spec §4.2):family 0x1A 混合拓扑 effClass 0→"Zen5 Core n"、
-// 1→"Zen5c Core n";effClass ≥2(非预期)与其他 family(单类)回退
+// HWiNFO 核名(spec §4.2):family 0x1A 混合拓扑 effClass 1→"Zen5 Core n"、
+// 0→"Zen5c Core n";effClass ≥2(非预期)与其他 family(单类)回退
 // "Core n"。编号 = 顺序核索引(cores_ 向量 0 基位置)—— 实测 amd.CSV
 // (Krackan Point 8C/16T)核列为 "Zen5 Core 0/Zen5c Core 1/Zen5 Core 2/
-// Zen5c Core 3/…"(顺序物理核索引,奇数位 Zen5c);repLP 取号在 SMT 机
-// 上会跳号(代表集 0/2/4/… -> Zen5c Core 2/6/…),与 CSV 不符。
-// Intel 探针同口径(LNL 1T/核下 index==repLP,数值不变)。
+// Zen5c Core 3/…"(顺序物理核索引);repLP 取号在 SMT 机上会跳号
+// (代表集 0/2/4/… -> Zen5c Core 2/6/…),与 CSV 不符。Intel 探针同口径
+// (LNL 1T/核下 index==repLP,数值不变)。
+// 实测口径(2026-09 两台实机取证,测量优先于文档直觉):Krackan 上冲
+// 5050 MHz 的核(真 Zen5)携带 class 1,3080 MHz 核(Zen5c)携带 class 0,
+// HWiNFO amd.CSV 恰把冲高的偶数位核命名为 "Zen5" —— 与 class 1 = Zen5
+// 吻合;Intel 侧 ARL-H 255H CPUID 0x1A 交叉核对同式(1=性能核)。经典
+// 文档直觉虽是 0=性能,实测为准。
 // "(perf #N)" 内部计数器后缀不复刻。
 std::string CoreName(size_t idx, const CoreInfo& c, unsigned family) {
     char buf[48];
-    if (family == 0x1A && c.effClass == 0)
+    if (family == 0x1A && c.effClass == 1)
         snprintf(buf, sizeof(buf), "Zen5 Core %u", (unsigned)idx);
-    else if (family == 0x1A && c.effClass == 1)
+    else if (family == 0x1A && c.effClass == 0)
         snprintf(buf, sizeof(buf), "Zen5c Core %u", (unsigned)idx);
     else
         snprintf(buf, sizeof(buf), "Core %u", (unsigned)idx);
@@ -492,7 +497,7 @@ private:
 
     // 拓扑规范化:cores 空/repLP 或线程 LP 越界 = 拓扑未知,退回
     // "每 LP 一个单线程核"(全部合成 effClass 0:family 0x1A 下命名即
-    // "Zen5 Core n" —— 单类合成拓扑,无 Zen5c;其他 family 为
+    // "Zen5c Core n" —— 单类合成拓扑,无 Zen5;其他 family 为
     // "Core n";编号 = 顺序核索引,单线程合成下恰等于 LP 号)—— 保底
     // 覆盖全部 LP,与 v2 全 LP 遍历语义一致(0xC001029A 逐核读退化为
     // 逐 LP 读,无 SMT 去重但保底不残缺;见 PowerDashModel.h cores 注释)。

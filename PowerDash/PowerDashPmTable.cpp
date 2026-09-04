@@ -20,9 +20,10 @@
 //                 一次,仍失败即放弃;OK 后表内存即新鲜浮点
 //   轮询      用户态有界忙等(≤1e6 次窗口读,无 sleep —— 总时长不得
 //             卡 1 s 采样环),超时按 response 0 处理(调用方视为失败)
-//   args 回读 SmuMsg 轮询命中后经 SmnEcam::ReadPage 从映射页内直接偏移
-//             (kSmnArgs & 0xFFF)+4*i 读回应答(测试假固件在页内镜像处
-//             写应答,见 msgHook;客户端从页回读而非经钩子取值)
+//   args 回读 SmuMsg 轮询命中后仍经 0xB8/0xBC 窗口逐字读 kSmnArgs+4*i
+//             (邮箱寄存器是 SMN 地址,不是 ECAM 配置页偏移 —— 全路径
+//             无页偏移捷径;测试假固件经 msgHook 把应答写进假寄存器堆,
+//             客户端从窗口回读而非经钩子取值)
 //   映射      表首所在页对齐,窗口 0x1000 字节(+ 页内偏移余量):
 //             mapSize = 0x1000 + (addr & 0xFFF)、base = addr & ~0xFFF;
 //             对象生存期持有,析构 UnmapPhys。At(byteOff) 读映射内
@@ -37,8 +38,9 @@
 
 namespace pd {
 
-// 测试注入点(生产:Locate 覆盖恒 nullptr / 钩子默认恒空)。
+// 测试注入点(生产:Locate/Access 覆盖恒 nullptr / 钩子默认恒空)。
 bool (*SmnEcamLocateOverride)(uint64_t&) = nullptr;
+std::function<bool(bool, uint32_t, uint32_t&)> SmnEcamAccessOverride = nullptr;
 std::function<void(uint32_t, uint32_t(&)[6])> SmuMsgHookDefault = nullptr;
 
 namespace {
@@ -139,8 +141,10 @@ bool SmnEcam::Init(DriverIo& io) {
 }
 
 /* SMN 写:0xB8 口闩 SMN 地址 -> 0xBC 口写数据(volatile,驱动 IO_CTL_MMAP
- * 映射的 MMIO;页内偏移 = (phys_ & 0xFFF) + reg,页对齐时前者为 0)。 */
+ * 映射的 MMIO;页内偏移 = (phys_ & 0xFFF) + reg,页对齐时前者为 0)。
+ * 测试覆盖非空时整体改道假寄存器堆(生产恒 nullptr,volatile 路径原样)。 */
 bool SmnEcam::Write(uint32_t smnAddr, uint32_t value) {
+    if (SmnEcamAccessOverride) return SmnEcamAccessOverride(true, smnAddr, value);
     if (map_ == nullptr) return false;
     auto* p = static_cast<volatile uint8_t*>(map_) + (phys_ & 0xFFFull);
     *reinterpret_cast<volatile uint32_t*>(p + kAddrPort) = smnAddr;
@@ -150,22 +154,12 @@ bool SmnEcam::Write(uint32_t smnAddr, uint32_t value) {
 
 /* SMN 读:0xB8 口闩 SMN 地址 -> 0xBC 口读数据。 */
 bool SmnEcam::Read(uint32_t smnAddr, uint32_t& out) {
+    if (SmnEcamAccessOverride) return SmnEcamAccessOverride(false, smnAddr, out);
     out = 0;
     if (map_ == nullptr) return false;
     auto* p = static_cast<volatile uint8_t*>(map_) + (phys_ & 0xFFFull);
     *reinterpret_cast<volatile uint32_t*>(p + kAddrPort) = smnAddr;
     out = *reinterpret_cast<volatile uint32_t*>(p + kDataPort);
-    return true;
-}
-
-/* ECAM 页内直接偏移 u32 读(SmuMsg args 回读路径):越页 false。 */
-bool SmnEcam::ReadPage(uint32_t pageOff, uint32_t& out) {
-    out = 0;
-    if (map_ == nullptr) return false;
-    const uint32_t off = static_cast<uint32_t>(phys_ & 0xFFFull) + pageOff;
-    if (off > 0x1000u - 4u) return false;
-    auto* p = static_cast<volatile uint8_t*>(map_) + off;
-    out = *reinterpret_cast<volatile uint32_t*>(p);
     return true;
 }
 
@@ -181,9 +175,9 @@ SmuPmTable::~SmuPmTable() {
 
 /* 单条 SMU 消息:清 response -> 写 args[0..5] -> 写 msg(均经 0xB8/0xBC
  * 窗口,即实机触发 SMU 的真写路径)-> msgHook(测试 seam:假固件此刻把
- * response 写到窗口数据口/应答 args 写到页内镜像)-> 窗口轮询 response
- * 至非零(≤1e6 次,超时返回 0)-> 页内直接偏移回读 args[0..5]。
- * 任一步越窗/未映射同样返回 0(调用方只认 0x1 = OK)。 */
+ * response/应答 args 写进寄存器堆)-> 窗口轮询 response 至非零(≤1e6
+ * 次,超时返回 0)-> 窗口逐字回读 args[0..5]。
+ * 任一步窗口访问失败同样返回 0(调用方只认 0x1 = OK)。 */
 uint32_t SmuPmTable::SmuMsg(uint32_t msg, uint32_t (&args)[kArgCount]) {
     if (!smn_.Write(kSmnRep, 0)) return 0;
     for (uint32_t i = 0; i < kArgCount; ++i)
@@ -197,7 +191,7 @@ uint32_t SmuPmTable::SmuMsg(uint32_t msg, uint32_t (&args)[kArgCount]) {
     }
     if (rep == 0) return 0;                    // 超时:SMU 未应答
     for (uint32_t i = 0; i < kArgCount; ++i)
-        if (!smn_.ReadPage(kArgsPageOff + 4u * i, args[i])) return 0;
+        if (!smn_.Read(kSmnArgs + 4u * i, args[i])) return 0;
     return rep;
 }
 

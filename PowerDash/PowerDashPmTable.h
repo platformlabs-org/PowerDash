@@ -29,9 +29,6 @@ public:
     bool Init(DriverIo& io);                       // 定位+映射页(ECAM 物理页,0x1000),失败 false
     bool Read(uint32_t smnAddr, uint32_t& out);    // volatile: wr 0xB8=addr; rd 0xBC
     bool Write(uint32_t smnAddr, uint32_t value);  // wr 0xB8=addr; wr 0xBC=value
-    // ECAM 页内直接偏移 volatile u32 读(SmuMsg 的 args 回读路径;测试假固件
-    // 在页内镜像处写应答,客户端从页回读 —— 见 SmuPmTable::msgHook)。
-    bool ReadPage(uint32_t pageOff, uint32_t& out);
     ~SmnEcam();                                    // UnmapPhys
     SmnEcam() = default;
     SmnEcam(const SmnEcam&) = delete;              // 持映射窗口,禁止拷贝(双解映射)
@@ -44,6 +41,17 @@ private:
 // 调它(单测注入固定 ECAM 基址,免依赖测试机真固件);生产恒 nullptr
 // -> 走 EnumSystemFirmwareTables 真固件路径。
 extern bool (*SmnEcamLocateOverride)(uint64_t& ecamPhysBase);
+
+// Read/Write 测试注入点(生产恒 nullptr -> volatile 0xB8/0xBC 页路径,
+// 行为与实机逐字节一致):非空时 Read/Write 整体改道 —— fixture 用它装
+// "假 SMN 寄存器堆"(map smnAddr->value;写 = 存值并记录,读 = 查值,
+// 未写地址读 0)。这是把 Read/Write 做成可替换后端的最小扰动形态:
+// SmuPmTable 内部持有按值的 SmnEcam,测试拿不到对象,经全局 seam 替换
+// 访问半部(SmuMsgHookDefault 同纪律)—— 客户端 SmuMsg 的全部寄存器
+// 访问(msg/rep/args)仍逐条经 SmnEcam::Read/Write,即实机同一条
+// 0xB8 闩地址 / 0xBC 数据单窗路径,无 ECAM 页偏移捷径。
+// write=true:窗口写(value=写值);write=false:窗口读(value=出参)。
+extern std::function<bool(bool write, uint32_t smnAddr, uint32_t& value)> SmnEcamAccessOverride;
 
 // SmuPmTable::msgHook 的全局默认(测试装假固件;生产恒空)。TryCreate/
 // Diagnose 内部构造的对象以它初始化 msgHook —— 测试拿不到内部对象,经此
@@ -66,17 +74,12 @@ struct SmuHandshakeTrace {   // TryCreate 各步结果(--pmdump 诊断输出)
 
 class SmuPmTable {
 public:
-    // 邮箱寄存器 kReg 名(SMN 地址;公共常量 —— fixture 假固件据此在 ECAM
-    // 页镜像处写应答,勿在别处重复字面量):
+    // 邮箱寄存器(SMN 地址 —— 经 SmnEcam 0xB8/0xBC 单窗访问,不是 PCI
+    // 配置页偏移;公共常量,fixture 假固件据此向假寄存器堆写应答,勿在
+    // 别处重复字面量):
     static constexpr uint32_t kSmnMsg = 0x3B10a20;    // 消息寄存器(写消息号触发)
     static constexpr uint32_t kSmnRep = 0x3B10a80;    // 响应寄存器(0 = 处理中)
     static constexpr uint32_t kSmnArgs = 0x3B10a88;   // 参数区基址(args[i] @ +4*i)
-    // 页内直接偏移(ECAM 页 = 假固件的 SMN 镜像;kSmnRep/kSmnArgs 低 12 位):
-    // fixture 假固件把 response 写到窗口数据口 SmnEcam::kDataPort(客户端
-    // 经 0xB8/0xBC 窗口轮询)、应答 args 写到 kArgsPageOff+4*i(客户端
-    // ReadPage 回读)。
-    static constexpr uint32_t kRepPageOff = kSmnRep & 0xFFFu;
-    static constexpr uint32_t kArgsPageOff = kSmnArgs & 0xFFFu;
 
     static std::unique_ptr<SmuPmTable> TryCreate(DriverIo& io);  // 失败 nullptr(诚实降级)
     static SmuHandshakeTrace Diagnose(DriverIo& io);   // 逐步执行,不构造对象、不映射 PM 表页(仅 ECAM 页 + step8 transfer)
@@ -88,10 +91,11 @@ public:
     uint64_t addr() const { return addr_; }
 
     // TEST SEAM:消息寄存器写入**之后**立即调用(生产恒空)。fixture 假
-    // 固件经它扮演 SMU:把 response 写到 ECAM 窗数据口(0xBC,客户端窗口
-    // 轮询可读)、把应答 args 写到页内直接偏移(kArgsPageOff+4*i,客户端
-    // 从页回读)—— 客户端读写仍全走映射页(真 ECAM 机制),不经钩子
-    // 取值;钩子只扮演固件。args 以引用传入(钩子可观察请求参数)。
+    // 固件经它扮演 SMU:把 response 写到假寄存器堆的 kSmnRep、应答 args
+    // 写到 kSmnArgs+4*i(客户端随后的 SmnEcam::Read 轮询/回读经同一窗口
+    // 路径看见)—— 客户端一切寄存器访问仍走 0xB8/0xBC 窗口(真 ECAM
+    // 机制),不经钩子取值;钩子只扮演固件。args 以引用传入(钩子可观察
+    // 请求参数)。
     std::function<void(uint32_t msg, uint32_t(&args)[6])> msgHook;
 
 private:

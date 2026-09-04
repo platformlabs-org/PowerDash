@@ -17,13 +17,10 @@ struct DeviceExtension
 {
     HANDLE devMemHandle;
     HANDLE counterSetHandle;
-    FAST_MUTEX smnMutex;       /* serializes the SMN 0xB8-addr / 0xBC-data window
-                                  pair in IO_CTL_SMN_READ/WRITE (AMD northbridge
-                                  B0:D0:F0, CF8/CFC 原生端口 I/O —— Hal 总线数据
-                                  接口经 pci.sys 写过滤,0xBC 数据口写实测被拒
-                                  (Krackan Point);WinRing0 生态(ryzenAdj/LHM)
-                                  同走 CF8/CFC 端口)。0x60/0x64 数据口写亦被拒,
-                                  两窗独立闩锁不可混用 */
+    FAST_MUTEX smnMutex;       /* serializes the 0x60-addr / 0x64-data SMN
+                                  window pair in IO_CTL_SMN_READ/WRITE (AMD
+                                  northbridge B0:D0:F0, Hal bus-data interface;
+                                  full evidence note above deviceControl) */
     PDEVICE_OBJECT lowerDO;     /* FDO only: device below us in the PnP stack */
 };
 
@@ -477,24 +474,13 @@ VOID MSRUnload(PDRIVER_OBJECT DriverObject)
 }
 
 
-/* 原生 CF8/CFC 配置周期(内核端口 I/O)—— HalSetBusDataByOffset 经
-   pci.sys 会被写过滤(B0:D0:F0 的 SMN 数据口 0xBC 写实测被拒,
-   Krackan Point);WinRing0 生态(ryzenAdj/LHM)同样走 CF8/CFC 端口。
-   仅支持 bus 0-15(legacy 机制覆盖范围),SMN 窗口在 B0:D0:F0,足够。 */
-static NTSTATUS PciCfgDwordRead(ULONG reg, ULONG32* out)
-{
-    if (reg & 3) return STATUS_INVALID_PARAMETER;
-    __outdword(0xCF8, 0x80000000u | (0u << 16) | (0u << 11) | (0u << 8) | reg);  /* B0:D0:F0 */
-    *out = __indword(0xCFC);
-    return STATUS_SUCCESS;
-}
-static NTSTATUS PciCfgDwordWrite(ULONG reg, ULONG32 value)
-{
-    if (reg & 3) return STATUS_INVALID_PARAMETER;
-    __outdword(0xCF8, 0x80000000u | (0u << 16) | (0u << 11) | (0u << 8) | reg);
-    __outdword(0xCFC, value);
-    return STATUS_SUCCESS;
-}
+/* SMN 访问实证注记(Krackan Point,labs-tb16g7 三轮实机):
+   0x60/0x64 Hal 读实证可用(Tctl);0x64 数据口写经 pci.sys 被拒
+   (HalSetBusDataByOffset != 4);CF8/CFC 端口 I/O 本平台异常(固件禁
+   传统配置机制,读写双向异常);SMU 邮箱写入走用户态 ECAM
+   (PowerDashPmTable:MCFG 定位 + IO_CTL_MMAP 映射 B0:D0:F0 页,
+   0xB8/0xBC 单窗,同 ryzen_smu 内核 ECAM 机制),本 IOCTL 写仅留作
+   其他 SMN 域未来使用。 */
 
 NTSTATUS deviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
@@ -698,29 +684,43 @@ NTSTATUS deviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
             case IO_CTL_SMN_READ:
             {
                 struct SMN_Request* req = (struct SMN_Request*)Irp->AssociatedIrp.SystemBuffer;
+                ULONG32 smnAddr = 0, smnData = 0;
                 if (inputSize < sizeof(struct SMN_Request))
                 {
                     status = STATUS_INVALID_PARAMETER;
                     break;
                 }
+                slot.u.AsULONG = 0;                          /* B0:D0:F0 */
                 ExAcquireFastMutex(&pExt->smnMutex);
+#pragma warning(push)
+#pragma warning(disable: 4996)
                 __try
                 {
-                    /* CF8/CFC 原生端口 I/O @ B0:D0:F0 0xB8(地址)/0xBC(数据),
-                       缘由见 PciCfgDwordRead 头注释 */
-                    /* 1) write the SMN address window 0xB8; sequential steps instead
+                    smnAddr = req->address;
+                    /* 1) write the SMN address window 0x60; nested if/else instead
                        of __leave so control always reaches the mutex release below */
-                    status = PciCfgDwordWrite(0xB8, req->address);
-                    /* 2) read the SMN data window 0xBC (same window as 0xB8 above;
-                       the 0x60/0x64 window has a separate address latch) */
-                    if (status == STATUS_SUCCESS)
-                        status = PciCfgDwordRead(0xBC, &req->value);
+                    if (HalSetBusDataByOffset(PCIConfiguration, 0, slot.u.AsULONG,
+                                              &smnAddr, 0x60, 4) != 4)
+                    {
+                        status = STATUS_DEVICE_NOT_READY;
+                    }
+                    /* 2) read the SMN data window 0x64 */
+                    else if (HalGetBusDataByOffset(PCIConfiguration, 0, slot.u.AsULONG,
+                                                   &smnData, 0x64, 4) != 4)
+                    {
+                        status = STATUS_DEVICE_NOT_READY;
+                    }
+                    else
+                    {
+                        req->value = smnData;
+                    }
                 }
                 __except (EXCEPTION_EXECUTE_HANDLER)
                 {
                     status = GetExceptionCode();
                     DbgPrint("PowerDash: SMN read exception 0x%X addr 0x%X\n", status, req->address);
                 }
+#pragma warning(pop)
                 ExReleaseFastMutex(&pExt->smnMutex);         /* every path incl. exceptions */
                 Irp->IoStatus.Information = sizeof(struct SMN_Request);   // METHOD_BUFFERED write-back
                 break;
@@ -729,27 +729,41 @@ NTSTATUS deviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
             case IO_CTL_SMN_WRITE:
             {
                 struct SMN_Request* req = (struct SMN_Request*)Irp->AssociatedIrp.SystemBuffer;
+                ULONG32 smnAddr = 0, smnData = 0;
                 if (inputSize < sizeof(struct SMN_Request))
                 {
                     status = STATUS_INVALID_PARAMETER;
                     break;
                 }
+                slot.u.AsULONG = 0;                          /* B0:D0:F0 */
                 ExAcquireFastMutex(&pExt->smnMutex);
+#pragma warning(push)
+#pragma warning(disable: 4996)
                 __try
                 {
-                    /* CF8/CFC 原生端口 I/O @ B0:D0:F0 0xB8(地址)/0xBC(数据),
-                       缘由见 PciCfgDwordRead 头注释;same window as IO_CTL_SMN_READ:
-                       the two SMN windows have separate address latches and the
-                       0x64 data port rejects writes on Krackan */
-                    status = PciCfgDwordWrite(0xB8, req->address);
-                    if (status == STATUS_SUCCESS)
-                        status = PciCfgDwordWrite(0xBC, req->value);
+                    smnAddr = req->address;
+                    smnData = req->value;
+                    /* same 0x60/0x64 window as IO_CTL_SMN_READ; the 0x64 data-port
+                       write is rejected by pci.sys on Krackan Point (evidence note
+                       above) - kept for future SMN domains, SMU mailbox uses
+                       user-space ECAM (PowerDashPmTable) */
+                    if (HalSetBusDataByOffset(PCIConfiguration, 0, slot.u.AsULONG,
+                                              &smnAddr, 0x60, 4) != 4)
+                    {
+                        status = STATUS_DEVICE_NOT_READY;
+                    }
+                    else if (HalSetBusDataByOffset(PCIConfiguration, 0, slot.u.AsULONG,
+                                                   &smnData, 0x64, 4) != 4)
+                    {
+                        status = STATUS_DEVICE_NOT_READY;
+                    }
                 }
                 __except (EXCEPTION_EXECUTE_HANDLER)
                 {
                     status = GetExceptionCode();
                     DbgPrint("PowerDash: SMN write exception 0x%X addr 0x%X\n", status, req->address);
                 }
+#pragma warning(pop)
                 ExReleaseFastMutex(&pExt->smnMutex);
                 Irp->IoStatus.Information = 0;
                 break;

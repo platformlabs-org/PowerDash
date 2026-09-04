@@ -55,11 +55,10 @@ bool WindowsDriverIo::WritePciCfg(unsigned bus, unsigned dev, unsigned fn,
 }
 
 bool WindowsDriverIo::ReadSmn(uint32_t smnAddr, uint32_t& out) {
-    // 驱动内 FAST_MUTEX 原子完成 0xB8 写地址 / 0xBC 读数据序列:CF8/CFC 原生端口
-    // I/O @ B0:D0:F0 0xB8/0xBC(地址/数据)。Hal 总线数据接口经 pci.sys 写过滤,
-    // 0xBC 数据口写实测被拒(Krackan Point);WinRing0 生态(ryzenAdj/LHM)同走
-    // CF8/CFC 端口。0x60/0x64 数据口写亦被拒,两窗独立闩锁不可混用;
-    // 结构体同缓冲进出(MethodBuffered),驱动 Information = sizeof(SMN_Request) 回写 value。
+    // 驱动内 FAST_MUTEX 原子完成 0x60 写地址 / 0x64 读数据序列:Hal 总线
+    // 数据接口 @ B0:D0:F0(读实证可用,Tctl 一路正确;实证注记见
+    // powerdash.c)。结构体同缓冲进出(MethodBuffered),驱动
+    // Information = sizeof(SMN_Request) 回写 value。
     SMN_Request req{};
     req.address = smnAddr;
     req.value = 0;
@@ -72,8 +71,9 @@ bool WindowsDriverIo::ReadSmn(uint32_t smnAddr, uint32_t& out) {
 }
 
 bool WindowsDriverIo::WriteSmn(uint32_t smnAddr, uint32_t value) {
-    // 同 ReadSmn 形态但无回读:驱动侧在互斥内 CF8/CFC 原生端口 I/O @ B0:D0:F0
-    // 写 0xB8(地址)/0xBC(数据),Information = 0,故输出缓冲传空。
+    // 同 ReadSmn 形态但无回读:驱动侧在互斥内 Hal 写 0x60(地址)/0x64
+    // (数据)。注:0x64 数据口写经 pci.sys 被 Krackan 拒(实证),SMU
+    // 邮箱写入走用户态 ECAM(SmnEcam);本通道留作其他 SMN 域未来使用。
     SMN_Request req{};
     req.address = smnAddr;
     req.value = value;

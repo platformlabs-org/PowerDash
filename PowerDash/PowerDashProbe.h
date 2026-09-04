@@ -7,8 +7,10 @@ namespace pd {
 class SensorTable;   // v3 宽表(PowerDashSensors.h);接口层只出指针,不引入定义
 
 // 驱动 IO 原语抽象:生产环境包装 DeviceIoControl(WindowsDriverIo),
-// 测试中用 FixtureDriverIo 注入应答。SMN 访问必须走 ReadSmn/WriteSmn
-// (驱动内原子互斥的 IO_CTL_SMN_READ/WRITE),禁止用户态拆写 0xB8/0xBC。
+// 测试中用 FixtureDriverIo 注入应答。SMN 直读(如 AMD k10temp Tctl)走
+// ReadSmn/WriteSmn(驱动内原子互斥的 IO_CTL_SMN_READ/WRITE,Hal
+// 0x60/0x64 读实证路径);SMU 邮箱不走此处 —— 用户态 ECAM(SmnEcam,
+// PowerDashPmTable.h:0x64 数据口写经 pci.sys 被拒、CF8/CFC 本平台异常)。
 class DriverIo {
 public:
     virtual ~DriverIo() = default;

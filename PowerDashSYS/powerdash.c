@@ -510,9 +510,12 @@ NTSTATUS deviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     {
         inputSize = IrpStackLocation->Parameters.DeviceIoControl.InputBufferLength;
 
-        if (IrpStackLocation->Parameters.DeviceIoControl.OutputBufferLength >=
-            sizeof(ULONG64))
-        {
+        /* OutputBufferLength gate removed: write-only IOCTLs (MSR_WRITE /
+           PCICFG_WRITE / SMN_WRITE / MUNMAP) legitimately pass a 0-length
+           output buffer; requiring >= 8 bytes rejected them all with
+           INVALID_PARAMETER before the handler ever ran (live-debugged on
+           labs-tb16g7: every IO_CTL_PCICFG_WRITE failed with err 87).
+           Output-needing cases validate their own output size below. */
             input_msr_req = (struct MSR_Request *)Irp->AssociatedIrp.SystemBuffer;
             input_pcicfg_req = (struct PCICFG_Request *)Irp->AssociatedIrp.SystemBuffer;
             input_mmap_req = (struct MMAP_Request*)Irp->AssociatedIrp.SystemBuffer;
@@ -777,9 +780,6 @@ NTSTATUS deviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
             default:
                 status = STATUS_INVALID_DEVICE_REQUEST;
             }
-        }
-        else
-            status = STATUS_INVALID_PARAMETER;
     }
     else
         status = STATUS_INVALID_DEVICE_REQUEST;

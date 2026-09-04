@@ -575,9 +575,68 @@ static int CmdSmnDbg(int argc, char* argv[]) {
                           << std::setfill(' ') << std::dec << std::endl;
             else {
                 std::cerr << "SMN 0x" << std::hex << addr << std::dec
-                          << " read failed" << std::endl;
+                          << " read failed (err=" << GetLastError() << " / 0x"
+                          << std::hex << GetLastError() << std::dec << ")"
+                          << std::endl;
                 rc = 2;
             }
+        }
+    } while (0);
+    CloseHandle(hDriver);
+    RemoveOursDriver();
+    return rc;
+}
+
+/* --pcidbg <bus> <dev> <fn> <hexreg> [hexvalue] - dump (or, with a value,
+ * write-then-dump) one PCI config dword through the driver's Hal path.
+ * Ring-up aid when SMN access misbehaves: separates "Hal config access
+ * broken" from "SMN portal register rejected" from "mutex-path issue".
+ * Hidden debug command, like --smndbg. */
+static int CmdPciDbg(int argc, char* argv[]) {
+    if (argc != 6 && argc != 7) {
+        std::cout << "usage: PowerDash --pcidbg <bus> <dev> <fn> <hexreg> [hexvalue]"
+                  << std::endl;
+        return 1;
+    }
+    const unsigned bus = (unsigned)strtoul(argv[2], nullptr, 0);
+    const unsigned dev = (unsigned)strtoul(argv[3], nullptr, 0);
+    const unsigned fn  = (unsigned)strtoul(argv[4], nullptr, 0);
+    const unsigned reg = (unsigned)strtoul(argv[5], nullptr, 16);
+
+    HANDLE hDriver = EnsureDriverLoaded();
+    if (hDriver == INVALID_HANDLE_VALUE) {
+        std::cerr << "Failed to open driver." << std::endl;
+        return 1;
+    }
+    int rc = 0;
+    do {
+        pd::WindowsDriverIo io(hDriver);
+        if (argc == 7) {                      /* write-then-read 模式 */
+            const uint32_t value = (uint32_t)strtoul(argv[6], nullptr, 16);
+            if (!io.WritePciCfg(bus, dev, fn, reg, value)) {
+                std::cerr << "PCI " << bus << ":" << dev << ":" << fn
+                          << " reg 0x" << std::hex << reg << std::dec
+                          << " WRITE failed (err=" << GetLastError() << ")"
+                          << std::endl;
+                rc = 2;
+            } else {
+                std::cout << "PCI " << bus << ":" << dev << ":" << fn
+                          << " reg 0x" << std::hex << reg << " <- 0x"
+                          << std::setw(8) << std::setfill('0') << value
+                          << std::setfill(' ') << std::dec << " (write ok)"
+                          << std::endl;
+            }
+        }
+        uint32_t v = 0;
+        if (io.ReadPciCfg(bus, dev, fn, reg, v))
+            std::cout << "PCI " << bus << ":" << dev << ":" << fn << " reg 0x"
+                      << std::hex << reg << " = 0x" << std::setw(8)
+                      << std::setfill('0') << v << std::setfill(' ')
+                      << std::dec << std::endl;
+        else {
+            std::cerr << "PCI read failed (err=" << GetLastError() << ")"
+                      << std::endl;
+            rc = 2;
         }
     } while (0);
     CloseHandle(hDriver);
@@ -1119,6 +1178,7 @@ int main(int argc, char* argv[]) {
     if (cmd == "-h" || cmd == "--help" || cmd == "/?") { Usage(); return 0; }
     if (cmd == "mode")   return CmdMode(argc, argv);
     if (cmd == "--smndbg") return CmdSmnDbg(argc, argv);
+    if (cmd == "--pcidbg") return CmdPciDbg(argc, argv);
     if (cmd == "--msrdbg") return CmdMsrDbg(argc, argv);
     if (cmd == "--pmdump") return CmdPmDump(argc, argv);
     if (cmd == "power") {

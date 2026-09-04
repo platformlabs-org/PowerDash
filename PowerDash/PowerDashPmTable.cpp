@@ -84,6 +84,9 @@ bool SmuPmTable::Refresh() {
         rep = SmuMsg(kMsgTransfer, args);
     }
     if (rep != kRepOk) return false;
+    /* Krackan 实测:rep=OK 后表并非立即可读 —— 立即读全零(60 帧采集
+     * 全 0.000 的实机证据),SMU 异步填充;等待后再放行读路径。 */
+    Sleep(10);
     refreshed_ = true;
     return true;
 }
@@ -127,17 +130,28 @@ std::unique_ptr<SmuPmTable> SmuPmTable::TryCreate(DriverIo& io) {
     //     按版本门控,本层只读不解读)。
     if (t->SmuMsg(kMsgVersion, args) != kRepOk) return nullptr;
     t->version_ = args[0];
-    // (d) 表物理地址(arg1 << 32 | arg0)。
+    // (d) 表物理地址。首取 arg0(32 位):实测 Krackan(labs-tb16g7,
+    // 23.3GB RAM)固件 arg0=0x5E280000、arg1=0x6 —— arg1 非地址高位,
+    // 按 ryzenAdj 的 arg1<<32|arg0 拼出 0x65E280000(27.4GB)超出物理
+    // 内存,映射必败。回退序:arg0 -> (arg1<<32)|arg0,映射成功即用。
     if (t->SmuMsg(kMsgAddr, args) != kRepOk) return nullptr;
-    t->addr_ = (static_cast<uint64_t>(args[1]) << 32) | args[0];
-    if (t->addr_ == 0) return nullptr;
+    if (args[0] == 0 && args[1] == 0) return nullptr;
     // (e) 页对齐映射:窗口 0x1000 字节 + 表首页内偏移余量(表可能跨页)。
     t->size_ = kWindow;
-    const uint64_t page = t->addr_ & ~0xFFFull;
-    const size_t mapLen = kWindow + static_cast<size_t>(t->addr_ & 0xFFFull);
+    const uint64_t candidates[2] = {
+        args[0], (static_cast<uint64_t>(args[1]) << 32) | args[0]};
     void* virt = nullptr;
-    if (!io.MapPhys(page, mapLen, virt)) return nullptr;
-    t->map_ = virt;
+    for (const uint64_t cand : candidates) {
+        const uint64_t page = cand & ~0xFFFull;
+        const size_t mapLen = kWindow + static_cast<size_t>(cand & 0xFFFull);
+        if (io.MapPhys(page, mapLen, virt) && virt != nullptr) {
+            t->addr_ = cand;
+            t->map_ = virt;
+            break;
+        }
+        virt = nullptr;
+    }
+    if (t->map_ == nullptr) return nullptr;
     // (f) 首次 transfer:此刻起表内存新鲜(失败 = SMU 拒绝服务,放弃)。
     if (!t->Refresh()) return nullptr;
     return t;
@@ -172,8 +186,9 @@ SmuHandshakeTrace SmuPmTable::Diagnose(DriverIo& io) {
     // (d) 地址消息。
     tr.addrRep = tmp.SmuMsg(kMsgAddr, args);
     if (tr.addrRep != kRepOk) { tr.failedStep = 5; return tr; }
-    tr.addr = (static_cast<uint64_t>(args[1]) << 32) | args[0];
-    if (tr.addr == 0) { tr.failedStep = 6; return tr; }
+    for (int i = 0; i < 6; ++i) tr.addrArgs[i] = args[i];
+    tr.addr = args[0];                        // 主候选(见 TryCreate (d) 实证注记)
+    if (tr.addr == 0 && args[1] == 0) { tr.failedStep = 6; return tr; }
     // (e) 映射步:跳过(见上);(f) 首次 transfer:单发 0x65 只看响应码。
     uint32_t targs[kArgCount] = {};
     tr.transferRep = tmp.SmuMsg(kMsgTransfer, targs);

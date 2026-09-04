@@ -403,7 +403,18 @@ public:
          * SetInvalid 已兜底,列不清、帧不废 —— PM 域与功率熔断无关,
          * 下一帧恢复即回值)。% = 实际/限值×100,限值 NaN 或 ≤0 -> NA
          * (不猜,准确度红线)。 */
-        const bool pmOk = pmKnown_ && pm_->Refresh();
+        /* 表有效性门:0x66 报告的地址在 Krackan 实测映射到全零页(传输
+         * rep=OK 但表未落该址,0x5E280000±1MB 无特征、页全零)。关键
+         * 锚点(限值/实际)同时为 0 判为无效页,本帧 PM 列全 NA —— 宁缺
+         * 毋假,严禁把零页当 0.0W/0.0A 输出;合法的单一限值 0 不受影响
+         * (只看多点同零)。表址定位为后续任务(--pmdump/--pmscan 已备)。 */
+        const bool pmOk = pmKnown_ && pm_->Refresh() && [this] {
+            const float sl = pm_->At(KpPm::StapmLimit);
+            const float sv = pm_->At(KpPm::StapmValue);
+            const float tl = pm_->At(KpPm::TdcLimit);
+            const float cl = pm_->At(KpPm::TctlLimit);
+            return !(sl == 0.0f && sv == 0.0f && tl == 0.0f && cl == 0.0f);
+        }();
         if (pmOk) {
             const auto pmSet = [&](int idx, uint32_t off) {
                 if (idx < 0) return;

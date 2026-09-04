@@ -587,11 +587,86 @@ static int CmdSmnDbg(int argc, char* argv[]) {
     return rc;
 }
 
-/* --pcidbg <bus> <dev> <fn> <hexreg> [hexvalue] - dump (or, with a value,
- * write-then-dump) one PCI config dword through the driver's Hal path.
- * Ring-up aid when SMN access misbehaves: separates "Hal config access
- * broken" from "SMN portal register rejected" from "mutex-path issue".
- * Hidden debug command, like --smndbg. */
+/* --pmscan - scan physical RAM in 256 MB views for the SMU PMTable float
+ * signature (Krackan known offsets: +0x00 STAPM limit W, +0x30 TDC limit A,
+ * +0x34 TDC actual A, +0x40 Tctl limit C, +0x44 Tctl actual C). Decisive
+ * ring-up aid when the 0x66-reported address maps to zeros: locates the
+ * LIVE table regardless of address-protocol quirks. RAM only (cached views
+ * of RAM are safe; MMIO holes fail the map and are skipped). Hidden debug
+ * command. */
+/* --pmscan 的分块扫描体:独立函数,无 C++ 对象(可承载 __try;
+ * C2712)。受限物理区(PSP/TSEG)可映射但访问即 fault —— 捕获后整块
+ * 跳过。返回命中数。 */
+static unsigned ScanChunkForPmSignature(const void* virt, uint64_t base,
+                                        uint64_t len) {
+    unsigned hits = 0;
+    __try {
+        const uint8_t* p = static_cast<const uint8_t*>(virt);
+        for (uint64_t off = 0; off + 0x48 < len; off += 4) {
+            float f0, f30, f34, f40, f44;
+            memcpy(&f0, p + off, 4);
+            memcpy(&f30, p + off + 0x30, 4);
+            memcpy(&f34, p + off + 0x34, 4);
+            memcpy(&f40, p + off + 0x40, 4);
+            memcpy(&f44, p + off + 0x44, 4);
+            if (f0 >= 10.0f && f0 <= 120.0f &&          /* STAPM limit W */
+                f30 >= 30.0f && f30 <= 200.0f &&        /* TDC limit A   */
+                f34 >= 0.0f && f34 <= 120.0f &&         /* TDC actual A  */
+                f40 >= 80.0f && f40 <= 110.0f &&        /* Tctl limit C  */
+                f44 >= 15.0f && f44 <= 110.0f) {        /* Tctl actual C */
+                printf("hit phys 0x%llX: stapm=%.3f tdc=%.3f/%.3f tctl=%.3f/%.3f\n",
+                       (unsigned long long)(base + off), f0, f30, f34, f40, f44);
+                fflush(stdout);
+                ++hits;
+                off += 0x1000 - 4;   /* 同页只报一次 */
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        printf("skip faulting chunk at phys 0x%llX\n", (unsigned long long)base);
+        fflush(stdout);
+    }
+    return hits;
+}
+
+static int CmdPmScan(int argc, char* argv[]) {
+    uint64_t scanLo = 0x100000ull, scanHi = 0x600000000ull;
+    if (argc == 4) {                     /* 可选:start end(十六进制物理地址) */
+        scanLo = strtoull(argv[2], nullptr, 16);
+        scanHi = strtoull(argv[3], nullptr, 16);
+    } else if (argc != 2) {
+        std::cout << "usage: PowerDash --pmscan [start end]" << std::endl;
+        return 1;
+    }
+    HANDLE hDriver = EnsureDriverLoaded();
+    if (hDriver == INVALID_HANDLE_VALUE) {
+        std::cerr << "Failed to open driver." << std::endl;
+        return 1;
+    }
+    int rc = 0;
+    unsigned hits = 0;
+    do {
+        pd::WindowsDriverIo io(hDriver);
+        /* 一次 0x65 传输先行(若邮箱可用),让表新鲜;失败不阻塞扫描。 */
+        {
+            auto pm = pd::SmuPmTable::TryCreate(io);
+            if (pm) (void)pm->Refresh();
+        }
+        const uint64_t kChunk = 256ull << 20;
+        for (uint64_t base = scanLo & ~(kChunk - 1); base + kChunk <= scanHi && hits < 16;
+             base += kChunk) {
+            if (base >= 0xC0000000ull && base < 0x100000000ull) continue;  /* MMIO 洞:跳过(缓存读 MMIO 未定义) */
+            void* virt = nullptr;
+            if (!io.MapPhys(base, kChunk, virt) || virt == nullptr) continue;
+            hits += ScanChunkForPmSignature(virt, base, kChunk);
+            io.UnmapPhys(virt);
+        }
+        if (!hits) { std::cout << "no signature found" << std::endl; rc = 2; }
+    } while (0);
+    CloseHandle(hDriver);
+    RemoveOursDriver();
+    return rc;
+}
+
 static int CmdPciDbg(int argc, char* argv[]) {
     if (argc != 6 && argc != 7) {
         std::cout << "usage: PowerDash --pcidbg <bus> <dev> <fn> <hexreg> [hexvalue]"
@@ -715,11 +790,22 @@ static int CmdPmDump(int argc, char* argv[]) {
                     tr.failedStep, tr.argReadback, tr.testRep, tr.versionRep,
                     tr.addrRep, tr.transferRep, tr.version,
                     (unsigned long long)tr.addr);
+            fprintf(stderr,
+                    "addr args: %08X %08X %08X %08X %08X %08X\n",
+                    tr.addrArgs[0], tr.addrArgs[1], tr.addrArgs[2],
+                    tr.addrArgs[3], tr.addrArgs[4], tr.addrArgs[5]);
             rc = 2;
             break;
         }
         printf("PMTable version: 0x%08X  addr: 0x%llX\n", pm->version(),
                (unsigned long long)pm->addr());
+        {   /* 0x66 应答 args 全量取证(地址格式排障;额外一轮握手,无害) */
+            const pd::SmuHandshakeTrace tr = pd::SmuPmTable::Diagnose(io);
+            printf("addr args: %08X %08X %08X %08X %08X %08X (diagStep=%d)\n",
+                   tr.addrArgs[0], tr.addrArgs[1], tr.addrArgs[2],
+                   tr.addrArgs[3], tr.addrArgs[4], tr.addrArgs[5],
+                   tr.failedStep);
+        }
         pm->Refresh();   /* TryCreate 已 transfer 过一次;再刷一次取最新帧 */
 
         std::ofstream file;
@@ -1179,6 +1265,7 @@ int main(int argc, char* argv[]) {
     if (cmd == "mode")   return CmdMode(argc, argv);
     if (cmd == "--smndbg") return CmdSmnDbg(argc, argv);
     if (cmd == "--pcidbg") return CmdPciDbg(argc, argv);
+    if (cmd == "--pmscan") return CmdPmScan(argc, argv);
     if (cmd == "--msrdbg") return CmdMsrDbg(argc, argv);
     if (cmd == "--pmdump") return CmdPmDump(argc, argv);
     if (cmd == "power") {

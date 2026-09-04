@@ -24,27 +24,29 @@ Pkg 与 Rest-of-System（PSYS − PKG，封装外的内存/板级损耗）双内
 非 VT 输出自动移除颜色。
 
 `--csv` 可与秒数交换位置，例如 `PowerDash power --csv capture.csv 60`。
-文件在启动时创建或覆盖；不指定秒数时持续记录到 Ctrl+C。CSV 为 v2 宽表
-（union 列 + `platform` 列）：无效读数（平台不支持或本帧读取失败）写**空单元格**
-（不是 0），`limit_locked` 为 0/1，`platform ∈ {intel, amd}`，列名单位后缀化：
+文件在启动时创建或覆盖；不指定秒数时持续记录到 Ctrl+C。**CSV v3(HWiNFO 对齐)**：
+表头 `Date,Time,"Elapsed [s]","Power Mode","<HWiNFO 传感器名>"...`，Date=`d.m.yyyy`、
+Time=`h:mm:ss.fff`（不补零），布尔列输出 `Yes/No`，无效读数写**空单元格**（不是 0），
+列名逐字符对齐 HWiNFO（含 `[单位]`/`(avg)`/`(Static)` 等），`Elapsed [s]`/`Power Mode`
+为本工具扩展列。列集按平台与拓扑动态生成（核数/核型/寄存器可读性探测），无效域整列
+省略；比对工具 `tools/compare-hwinfo.py` 可与 HWiNFO 采样 CSV 逐列比对：
 
 ```
-timestamp,elapsed_s,platform,pkg_w,cores_w,gfx_w,platform_w,
-limit_sustained_w,limit_sustained_window_s,limit_burst_w,limit_locked,
-tdc_a,edc_a,temp_c,freq_ghz,util_pct,c0_pct,c2_pct,c6_pct,smi_delta,mode
+python tools/compare-hwinfo.py <hwinfo.csv> <ours.csv>
 ```
 
-v1 → v2 迁移表：
+Intel 列组：每核 Clock/VID（MSR 0x198）、每线程 Effective（ΔAPERF/Δt）、温度/距 TjMax/
+降频三态位（0x19C/0x1B1）、封装与每核 C-state 驻留、PL1/PL2 静态（0x610）与动态
+（MMIO）、cTDP、IA/GT/Ring Limit Reasons（0x64F/0x650/0x651 log 位）、Usage/Utility
+（逐线程）。AMD 列组：每核 Clock/VID（0xC0010293）、每线程 Effective/C0（RO 别名
+APERF/MPERF）、Tctl（SMN 0x59800）、逐核功率、EPP（0xC00102B3）、Usage/Utility。
+核型命名 P/E-core 与 Zen5/Zen5c：**Windows EfficiencyClass 1=性能核**（ARL-H CPUID
+0x1A 与 Krackan 5050/3080MHz 双机实测）。已知语义差：AMD "Clock" 为 COFVID 目标频率，
+HWiNFO "(perf #N)" 为计数器加权实际频率（深 idle 态均值偏低）。
 
-| v1 列 | v2 列 |
-|---|---|
-| pkg_w | pkg_w(不变) |
-| ia_w | cores_w |
-| gt_w | gfx_w |
-| sys_w | platform_w |
-| pl1_w / pl2_w | limit_sustained_w / limit_burst_w |
-| (无) | limit_sustained_window_s, tdc_a, edc_a, platform, limit_locked |
-| c0/c2/c6_pct, smi_delta, mode, temp_c, freq_ghz, util_pct | 同名保留 |
+调试命令（隐藏）：`--smndbg <addr>`、`--msrdbg <core> <msr>`、`--pcidbg <b> <d> <f> <reg> [val]`、
+`--pmdump [file]`（SMU PMTable 握手诊断+全表导出）、`--pmscan [start end]`（物理内存
+PMTable 特征扫描）。v2 → v3：旧 21 列宽表整体移除，迁移无对应表（格式完全更换）。
 
 ## AMD 支持（实验性）
 

@@ -91,6 +91,23 @@ bool SmuPmTable::Refresh() {
     return true;
 }
 
+/* --pmxfer 取证:Raven 老流程的 0x66/0x65 都带表选择子 arg0(TA=3,
+ * TABLE_MOMENTARY_PM=5);Renoir+ 改裸调。Krackan 裸调 rep=OK 但表不落
+ * 0x66 所报地址 —— 试验带选择子的 0x65 是否触发填充。锚点取
+ * 0x00/0x30/0x40/0x9D8(STAPM/Tdc/Tctl/Strix 系 CorePower[0])。 */
+uint32_t SmuPmTable::TransferProbe(uint32_t tableId, float anchors[4]) {
+    uint32_t args[kArgCount] = {};
+    args[0] = tableId;
+    const uint32_t rep = SmuMsg(kMsgTransfer, args);
+    if (rep == kRepOk) Sleep(20);
+    refreshed_ = true;                     // 允许 At 读(取证不设防)
+    anchors[0] = At(0x00);
+    anchors[1] = At(0x30);
+    anchors[2] = At(0x40);
+    anchors[3] = At(0x9D8);
+    return rep;
+}
+
 /* 表内 float 读取:越界(byteOff + 4 > 窗口)/未刷新/未映射 -> NaN。 */
 float SmuPmTable::At(uint32_t byteOff) const {
     if (map_ == nullptr || !refreshed_) return std::nanf("");

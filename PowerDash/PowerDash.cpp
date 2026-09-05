@@ -667,6 +667,46 @@ static int CmdPmScan(int argc, char* argv[]) {
     return rc;
 }
 
+/* --pmxfer [id] - Krackan PMTable 全零之谜取证:对 0x65 传 arg0=表
+ * 选择子(0..8 逐个,或指定 id),打印 rep 码与 4 个锚点浮点
+ * (0x00/0x30/0x40/0x9D8)。假设:新固件回归了 Raven 老流程的选择子
+ * 语义(TABLE_MOMENTARY_PM=5),裸 0x65 rep=OK 但不写表。隐藏命令。 */
+static int CmdPmXfer(int argc, char* argv[]) {
+    unsigned lo = 0, hi = 8;
+    if (argc == 3) {
+        lo = hi = (unsigned)strtoul(argv[2], nullptr, 0);
+    } else if (argc != 2) {
+        std::cout << "usage: PowerDash --pmxfer [tableId]" << std::endl;
+        return 1;
+    }
+    HANDLE hDriver = EnsureDriverLoaded();
+    if (hDriver == INVALID_HANDLE_VALUE) {
+        std::cerr << "Failed to open driver." << std::endl;
+        return 1;
+    }
+    int rc = 0;
+    do {
+        pd::WindowsDriverIo io(hDriver);
+        auto pm = pd::SmuPmTable::TryCreate(io);
+        if (!pm) {
+            std::cerr << "PMTable unavailable" << std::endl;
+            rc = 2;
+            break;
+        }
+        printf("version=0x%08X addr=0x%llX\n", pm->version(),
+               (unsigned long long)pm->addr());
+        for (unsigned id = lo; id <= hi; ++id) {
+            float a[4] = {};
+            const uint32_t rep = pm->TransferProbe(id, a);
+            printf("id=%u rep=0x%02X  0x00=%g 0x30=%g 0x40=%g 0x9D8=%g\n",
+                   id, rep, a[0], a[1], a[2], a[3]);
+        }
+    } while (0);
+    CloseHandle(hDriver);
+    RemoveOursDriver();
+    return rc;
+}
+
 static int CmdPciDbg(int argc, char* argv[]) {
     if (argc != 6 && argc != 7) {
         std::cout << "usage: PowerDash --pcidbg <bus> <dev> <fn> <hexreg> [hexvalue]"
@@ -1266,6 +1306,7 @@ int main(int argc, char* argv[]) {
     if (cmd == "--smndbg") return CmdSmnDbg(argc, argv);
     if (cmd == "--pcidbg") return CmdPciDbg(argc, argv);
     if (cmd == "--pmscan") return CmdPmScan(argc, argv);
+    if (cmd == "--pmxfer") return CmdPmXfer(argc, argv);
     if (cmd == "--msrdbg") return CmdMsrDbg(argc, argv);
     if (cmd == "--pmdump") return CmdPmDump(argc, argv);
     if (cmd == "power") {

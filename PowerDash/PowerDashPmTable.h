@@ -30,6 +30,7 @@ struct SmuHandshakeTrace {   // TryCreate 各步结果(--pmdump 诊断输出)
     uint32_t testRep = 0, versionRep = 0, addrRep = 0, transferRep = 0;
     uint32_t version = 0;
     uint64_t addr = 0;
+    uint32_t addrArgs[6] = {};    // step5 应答 args[0..5] 原样(地址格式取证)
 };
 
 class SmuPmTable {
@@ -44,6 +45,9 @@ public:
     static SmuHandshakeTrace Diagnose(DriverIo& io);   // 逐步执行,不构造对象、不映射(到 step7 为止的只读诊断 + step8 transfer)
     ~SmuPmTable();                        // UnmapPhys 映射窗口
     bool Refresh();                       // 每帧:transfer 0x65(拒绝→10ms 重试一次)
+    /* --pmxfer 取证:以 arg0=tableId 裸发 0x65(Raven 老流程传表选择子;
+     * Krackan 表全零之谜的候选解释),回 rep 码并采样锚点浮点。 */
+    uint32_t TransferProbe(uint32_t tableId, float anchors[4]);
     float At(uint32_t byteOff) const;     // float@偏移;越界/未刷新 NAN
     bool AtBits(uint32_t byteOff, uint32_t& out) const;  // 原始 4 字节@偏移;越界/未刷新 false(--pmdump 十六进制列)
     uint32_t version() const { return version_; }

@@ -406,3 +406,6 @@ tests/build/
 package/PowerDash.sys
 package/PowerDash.cat
 package/PowerDash.inf
+
+# 内部工作文档(specs/plans/台账,本地保留不入库)
+docs/

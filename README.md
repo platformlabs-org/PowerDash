@@ -1,263 +1,77 @@
 # PowerDash
 
-Lenovo 小新/IdeaPad（83NC 一代）电源工具箱：功率监视、功耗墙设定、
-电源模式切换（含 Fn+Q OSD 合成）。**单文件分发**——内核驱动以资源形式
-内嵌在 exe 里，运行时自动安装/卸载，系统零残留。
+Lenovo 小新/IdeaPad 电源工具箱:CPU 遥测采集(HWiNFO 对齐宽表 CSV)、功耗墙设定、电源模式查询与切换。内核驱动以内嵌资源随单文件 exe 分发,按需自动装卸,系统零残留。
 
-## 功能
+## 命令
 
 ```
-PowerDash                          双击/空参数：清屏置顶后打印使用说明，并驻留一个 cmd（已 cd 到 exe 目录）；每次运行都会清屏置顶并显示 CPU 信息（型号+代号）
+PowerDash                          无参数:显示帮助并驻留 cmd(双击场景)
 PowerDash power [秒数] [--csv 文件]
-                                  分组式实时功率面板；可同时逐秒保存完整采样 CSV
-PowerDash -setpl <PL1> <PL2>       设定并锁定功耗墙（W）
-PowerDash mode status              查询电源档位（无需本驱动）
-PowerDash mode next                仅注入 Fn+Q 通知，由 Lenovo 组件切档并弹 OSD
+                                   实时面板;可选逐秒保存 CSV(不指定秒数则运行至 Ctrl+C)
+PowerDash -setpl <PL1> <PL2>       设定并锁定功耗墙(瓦,仅 Intel)
+PowerDash mode status              查询当前电源档位与固件能力档(无需本驱动)
+PowerDash mode next                注入 Fn+Q 通知(由 Lenovo 组件切档并弹 OSD)
 PowerDash -h                       帮助
 ```
 
-帮助页与无参数启动显示相同的三行 PowerDash ASCII Art。实时面板优先使用 96 列，
-在 72–91 列窗口自动改为单列诊断布局；SYSTEM POWER 区以平台总功率为标题，
-Pkg 与 Rest-of-System（PSYS − PKG，封装外的内存/板级损耗）双内联功率条
-分解它（两者之和恒等于标题值），共享同一刻度（0 → PL2，竖线标记 PL1），
-颜色区分正常、警告和危险状态，历史区显示最近 60 秒的 Min/Avg/Max。
-非 VT 输出自动移除颜色。
+`--csv` 与秒数可互换位置。加载内核驱动需管理员权限。
 
-`--csv` 可与秒数交换位置，例如 `PowerDash power --csv capture.csv 60`。
-文件在启动时创建或覆盖；不指定秒数时持续记录到 Ctrl+C。**CSV v3(HWiNFO 对齐)**：
-表头 `Date,Time,"Elapsed [s]","Power Mode","<HWiNFO 传感器名>"...`，Date=`d.m.yyyy`、
-Time=`h:mm:ss.fff`（不补零），布尔列输出 `Yes/No`，无效读数写**空单元格**（不是 0），
-列名逐字符对齐 HWiNFO（含 `[单位]`/`(avg)`/`(Static)` 等），`Elapsed [s]`/`Power Mode`
-为本工具扩展列。列集按平台与拓扑动态生成（核数/核型/寄存器可读性探测），无效域整列
-省略；比对工具 `tools/compare-hwinfo.py` 可与 HWiNFO 采样 CSV 逐列比对：
+## 调试 / 取证命令(隐藏)
+
+```
+PowerDash --smndbg <hexaddr>            读一个 SMN 寄存器(连读两次)
+PowerDash --msrdbg <core> <hexmsr>      读一个 per-core MSR(间隔 1s 连读两次)
+PowerDash --pcidbg <b> <d> <f> <reg> [val]
+                                        读(或写后读)一个 PCI 配置 dword
+PowerDash --pmdump [file]               SMU PMTable 握手诊断 + 全表浮点导出
+PowerDash --pmscan [start end]          物理内存 PMTable 特征扫描
+PowerDash --pmxfer [tableId]            SMU 传输消息表选择子取证
+```
+
+## CSV 格式(v3,HWiNFO 对齐)
+
+表头 `Date,Time,"Elapsed [s]","Power Mode",<HWiNFO 传感器名>...`;Date=`d.m.yyyy`、Time=`h:mm:ss.fff`;布尔列输出 `Yes/No`;无效读数写空单元格(不是 0);列集按平台与拓扑动态生成,不可采的域整列省略。`Elapsed [s]` 与 `Power Mode` 为本工具扩展列。
+
+列组(按平台自动选择):
+
+| 平台 | 列组 |
+|---|---|
+| Intel | 每核 Clock/VID、每线程 Effective/Usage/Utility、每核温度/距 TjMax/降频三态位、封装与每核 C-state 驻留、PL1/PL2(静态/动态)、cTDP、IA/GT/Ring Limit Reasons、功率域(PKG/IA/GT/PSYS) |
+| AMD | 每核 Clock/VID、每线程 Effective/Usage/Utility、每核 C0 驻留、Tctl、逐核功率、EPP、功率域(PKG/每核) |
+
+核型命名:P-core/E-core/Zen5/Zen5c(按 Windows EfficiencyClass,编号为顺序核索引)。
+
+与 HWiNFO 采样 CSV 逐列比对:
 
 ```
 python tools/compare-hwinfo.py <hwinfo.csv> <ours.csv>
 ```
 
-Intel 列组：每核 Clock/VID（MSR 0x198）、每线程 Effective（ΔAPERF/Δt）、温度/距 TjMax/
-降频三态位（0x19C/0x1B1）、封装与每核 C-state 驻留、PL1/PL2 静态（0x610）与动态
-（MMIO）、cTDP、IA/GT/Ring Limit Reasons（0x64F/0x650/0x651 log 位）、Usage/Utility
-（逐线程）。AMD 列组：每核 Clock/VID（0xC0010293）、每线程 Effective/C0（RO 别名
-APERF/MPERF）、Tctl（SMN 0x59800）、逐核功率、EPP（0xC00102B3）、Usage/Utility。
-核型命名 P/E-core 与 Zen5/Zen5c：**Windows EfficiencyClass 1=性能核**（ARL-H CPUID
-0x1A 与 Krackan 5050/3080MHz 双机实测）。已知语义差：AMD "Clock" 为 COFVID 目标频率，
-HWiNFO "(perf #N)" 为计数器加权实际频率（深 idle 态均值偏低）。
-
-调试命令（隐藏）：`--smndbg <addr>`、`--msrdbg <core> <msr>`、`--pcidbg <b> <d> <f> <reg> [val]`、
-`--pmdump [file]`（SMU PMTable 握手诊断+全表导出）、`--pmscan [start end]`（物理内存
-PMTable 特征扫描）。v2 → v3：旧 21 列宽表整体移除，迁移无对应表（格式完全更换）。
-
-## AMD 支持（实验性）
-
-AMD 平台（CPUID `AuthenticAMD` 自动识别，Ryzen 移动 APU）当前支持**监控子集**：
-
-- **支持**：封装/核功率（能量计数器差分）、温度（Tctl）、频率（APERF/MPERF）、
-  CPU 利用率、电源模式（mode）。
-- **面板自动降级**：顶区标题为 PACKAGE POWER（无 PSYS 总功率），POWER DOMAINS
-  只显示 IA 行（无 GT/SYSTEM），温度无 `/ TjMax` 后缀（TjMax 未知时），
-  CPU RESIDENCY / SMI / POWER LIMITS 区整体隐藏，功率条刻度回退 60 W spec
-  默认值（`spec` 标注）。
-- **不支持**：PSYS/GT 功率、C0/C2/C6 驻留率、SMI 计数、功耗墙读取与设定
-  （`-setpl` 走 Intel MCHBAR 路径，AMD 上明确拒绝并提示规划中）——SMU PMTable
-  限值解码列为实测机到位后的后续任务。
-- **CSV v2 语义**：平台不支持的列持续写**空单元格**（不是 0），`platform` 列
-  为 `amd`；下游以空单元格区分"平台不支持"与"读数为零"。
-
-### AMD 实测修复记录（labs-tb16g7，Ryzen AI 7 350 / Krackan Point，family 0x1A）
-
-2026-09-01 首轮实测发现的三个缺陷及修法（证据详见当日验收报告）：
-
-1. **逐核能量 SMT 双计**：`0xC001029A` 按物理核计数，SMT 兄弟 LP 共享同一
-   计数器（实测 LP0/LP1 差分速率 877590/868173 raw/s，1% 内相等）。Windows
-   枚举同核兄弟为**相邻** LP（8C/16T 的核 mask 为 0x0003/0x000C/…，即
-   {0,1}{2,3}…，不是 n/n+8），故遍历"前 nCores 个 LP"只会读到一半核 ×2。
-   修复：入口层从 `GetLogicalProcessorInformation` 提取每个物理核 mask 的
-   最低置位 LP 作代表（`PlatformInfo.coreLPs`），探针每核只读一个代表 LP。
-   修后实测：idle IA 0.1-0.6 W，4 烧机载荷 IA 81-84% of PKG（修前 167%）。
-2. **温度虚高 49 C**：family 0x1A 的 SMN 0x59800（Tctl，Linux k10temp：
-   "Common for Zen CPU families (17h/18h/19h/1Ah)"）恒带 RANGE_SEL(bit19)，
-   按 k10temp 语义需 `-49 C`（bit19=1 或 TJ_SEL[17:16]=0b11 时；17h 上该位
-   通常为 0，故旧解码在老平台上恰好正确）。实测 raw idle 0x510B0000 →
-   32 C、21 W 0x7D8B0000 → 76.5 C、52 W → 92.5 C；修前面板读 81/126/141 C。
-3. **频率恒 NA**：AMD 不实现 CPUID 0x16（读 0）。基频改从 P-state P0
-   （MSR 0xC0010064）的 CpuFid 解码：family 0x1A 为 `CpuFid[11:0] * 5 MHz`
-   （PPR 57896-B0 CoreCOF 定义，LibreHardwareMonitor Amd17Cpu.cs 同式），
-   17h/19h 为 `CpuFid[7:0] / CpuDfsId[13:8] * 200`（PPR 55570-B1 / PPR 19h
-   Model 70h，libcpuid/CoreFreq 同式）。实测 P0 raw 0x...C1 90 → fid 0x190
-   → 2.0 GHz，与规格页标称基频一致；修后 FREQ idle ~2.0 GHz、满载 ~4.9 GHz。
-
-能量定标沿用 0xC0010299（RAPL_POWER_UNIT 位兼容 Intel；该机 energy bits=16，
-实测 pkg idle 差分 142119 raw/s = 2.17 W，交叉验证定标正确）。
-
-### SMN/MSR 调试工具（隐藏命令）
-
-```
-PowerDash --smndbg <hexaddr>     读一个 SMN 寄存器原始值（连读两次并打印，
-                                  部分 SMN 读需要一次 priming；如 --smndbg 0x59800）
-PowerDash --msrdbg <core> <hexmsr>  读一个 per-core MSR 原始值（间隔 1 s 连读
-                                  两次，能量计数器的差分可见；如 --msrdbg 0 0xC001029A）
-```
-
-两条命令与 `power` 走同一驱动装卸生命周期（透明安装/退出回收），仅打印
-原始值不做解码——SMN 地图核对与未来 PMTable bring-up 的取证工具，不属于
-监控路径。
-
-## 单 exe 无感驱动装卸
-
-`PowerDash.exe` 内嵌 `PowerDash.sys`（资源 `IDR_SYS_DRIVER`）。需要内核功能的
-命令会在后台自动完成：提取到 `%TEMP%\PowerDashDrv.sys` → 安装服务
-`PowerDashSYS` → 启动 → 工作 → 停止 → 删服务 → 删文件。若设备已在运行
-（外部手动加载）则直接复用、退出时不动它；若发现本工具先前实例硬杀留下的
-孤儿服务（镜像路径匹配），则收养并在退出时回收。全程无需用户操作。
-
-## 组成
-
-| 工程 | 说明 |
-|---|---|
-| `PowerDashSYS` | 内核驱动：MSR 读写、PCI 配置读写、物理内存映射、PMU 计数器分配、**Fn+Q 通知注入**（`IO_CTL_FNQ_INJECT`） |
-| `PowerDash` | 用户态 CLI |
-
-## 架构（分层）
-
-用户态按「入口 → Probe → Sampler → UI/CSV」四层拆分，平台差异收敛在 Probe 层，
-下游只消费统一模型：
-
-```
-PowerDash.cpp          CLI 入口：参数解析、命令分发、驱动装卸生命周期（瘦身后仅剩编排）
-  └─ CreateProbe()（PowerDashProbe.h：IPlatformProbe 接口 + PlatformCaps 能力位）
-       ├─ PowerDashIntel.cpp    Intel：RAPL 能量 MSR、MCHBAR PL1/PL2、TjMax、
-       │                        C2/C6 驻留、SMI（自旧 RunPowerMonitor 迁出）
-       └─ PowerDashAmd.cpp      AMD：能量计数器差分、SMN 温度、APERF/MPERF 频率；
-                                能力位诚实降级（无 PSYS/GT/驻留/SMI/限值）
-            │ 每秒 readSample(Sample&)
-            ▼
-       PowerDashSampler.*        采样引擎：节拍、时间戳/elapsed/util/mode 填充（能量差分/回绕在各 Probe，历史窗口在入口 sink）
-            │ 统一 Sample v2 模型（PowerDashModel.h：Reading 自带 valid 语义，
-            │ 根除「0 是零值还是不支持」歧义；Decompose 供功率条分解）
-            ├─ PowerDashUi.*     面板渲染：RenderDashboard 只读统一模型，
-            │                   按 PlatformCaps 自动降级（见「AMD 支持」）
-            └─ CSV v2 宽表      CsvRow(Vendor, Sample)：union 列 + platform 列，
-                                无效读数写空单元格
-PowerDashSYS            内核驱动新增 IO_CTL_SMN_READ：AMD SMN 地址/数据寄存器
-                        （NB 0x60/0x64）单次 IOCTL 原子互斥读取，取代用户态
-                        PCICFG 写→读配对，内核侧序列化防并发交错
-```
-
-设计全文（模块边界、类型体系、表述映射表、CSV v2 schema、降级矩阵、测试策略）：
-[docs/superpowers/specs/2026-09-01-powerdash-architecture-design.md](docs/superpowers/specs/2026-09-01-powerdash-architecture-design.md)。
-
-**后续任务**：AMD 限值读取（PPT/TDC/EDC，SMU PMTable 解码）待一台 **AMD Lenovo
-实机**到位后实施——需实测核对 family 偏移表（PMTable 布局随 CPU 世代变化），
-这是当前 AMD 面板 POWER LIMITS 区隐藏、CSV 限值列为空的唯一缺口。
-
 ## 构建
 
-VS2022 + WDK 10（本机已含）。命令行：`build.cmd`（Release x64，驱动自动测试签名）。
-应用工程引用 PowerDashSYS（先构建驱动）并把 `PowerDash.sys` 嵌入 exe 资源，
-产出的 `x64\Release\PowerDash.exe` 即为单文件分发物。
-若提示缺少 Spectre 缓解库，工程已配置禁用；如再遇到可加 `/p:SpectreMitigation=false`。
-
-### 分离编译 + 手动签名（推荐分发流程）
-
-**构建永不自动签名**——`PowerDash.sys` 产出为未签名状态，签名永远是你显式的一步：
-
-```bat
-build-sys.cmd        :: 1. 只构建驱动（未签名）
-signtool sign /v /fd SHA256 /tr <时间戳服务器> /td SHA256 /a x64\Release\PowerDashSYS\PowerDash.sys
-                      :: 2. 用你自己的证书签名（attestation/EV 证书同理）
-build-exe.cmd        :: 3. 只构建 exe 并嵌入刚签好的驱动
-python verify_embed.py
-                      :: 4. 校验嵌入的驱动与签名版逐字节一致
-```
-
-开发自用可 `sign-test.cmd` 用本地测试证书显式签名（需 testsigning 模式）。
-
-### INF 版本号
-
-INF 的 `DriverVer` 版本已固定（默认 `1.0.0.0`）——默认行为是 WDK 每次构建
-盖上时间派生版本（`HH.MM.SS.mmm`），看起来像随机数。指定版本：
-
-```bat
-build-sys.cmd 1.2.3        :: DriverVer=日期,1.2.3.0（stampinf 自动补足四段）
-build.cmd 1.2.3            :: 全量构建同样支持
-```
-
-日期部分仍为构建当天（正式发布惯例），如需完全固定可在 vcxproj 中同时设置
-`SpecifyDriverVerDirectiveDate` + `DateStamp`。
-
-`build-exe.cmd` 使用 `/p:BuildProjectReferences=false` 防止 msbuild 重编驱动
-覆盖你的签名，并强制删除缓存的 `.res`（MSBuild 不追踪 .rc 内引用的二进制，
-不删会嵌入旧驱动）。
-
-驱动加载需要系统开启测试签名（一次性，需重启）；**若用 attestation 证书
-签名则无此要求，可直接在任意 Win10/11 上运行**：
+VS2022 + WDK 10。常规构建(驱动产物未签名):
 
 ```
-bcdedit /set testsigning on
+build.cmd            :: 全量(驱动 + exe)
+build-sys.cmd [版本] :: 仅驱动
+build-exe.cmd        :: 仅 exe(嵌入 x64\Release\PowerDashSYS\PowerDash.sys)
 ```
 
-## INF 安装（primitive 驱动包方式，可选）
-
-INF 为 **primitive driver package**（`PrimitiveDriver=1` + `PnpLockdown=1`，
-驱动从 DriverStore（DIRID 13）隔离运行，无 PnP 设备节点）——通过 InfVerif
-Desktop 与 Universal 双重验证，适用于正式分发（attestation 签名场景）：
-
-```bat
-build-sys.cmd [版本]          :: 未签名驱动
-signtool sign ... PowerDash.sys   :: 你的证书
-package.cmd                   :: 生成 package\{PowerDash.inf, .sys, .cat}
-                                  （inf2cat + cat 测试签名，发布时换你的证书）
-```
-
-安装/卸载（纯 pnputil，无设备节点、无幽灵残留）：
-
-```bat
-pnputil /add-driver package\PowerDash.inf /install      :: 入库 + 创建服务 powerdash
-sc start powerdash                                       :: 启动（按需）
-sc stop powerdash
-pnputil /delete-driver oem##.inf /uninstall /force       :: 卸载
-```
-
-安装后 `PowerDash.exe` 检测到 `\\.\POWERDASH` 已存在会直接复用、退出时不会
-卸载；驱动内置双实例保护（后加载实例复用先加载实例的控制设备）。
-
-测试证书注意：DriverStore 入库对目录做完整证书链校验（testsigning 不豁免），
-测试机的自签证书需导入 `LocalMachine\Root` 和 `TrustedPublisher`。
-
-## 手动加载驱动（可选）
-
-设备名设计为 `\Driver\POWERDASH`，**服务名不能叫 `PowerDash`**（驱动对象与设备名
-大小写不敏感冲突，StartService 报错 6）。自动装卸使用的服务名是 `PowerDashSYS`；
-如需手动常驻：
+分发签名流程(attestation 证书,加载无需 testsigning):
 
 ```
-sc create PowerDashSYS type= kernel start= demand binPath= "<绝对路径>\PowerDash.sys"
-sc start PowerDashSYS
+1. build-sys.cmd 产出未签名驱动
+2. 提交微软 attestation 签名
+3. use-signed.cmd <已签名 PowerDash.sys 路径>   :: 拷入嵌入位 + 重编 exe + 校验一致
+4. python verify_embed.py                       :: RESULT: MATCH
 ```
 
-## Fn+Q 注入原理（IO_CTL_FNQ_INJECT）
+开发自用可用 `sign-test.cmd` 本地测试证书签名(需 `bcdedit /set testsigning on` 并重启)。
 
-真实按键时 EC 固件改写 DYTC 档位并发出 ACPI 通知；`AcpiVpc.sys` 收到后把
-mode2 通知计数器置 1 并击发注册事件，`FnHotkeyUtility` 醒来读"当前档位"弹 OSD，
-Lenovo Dispatcher 随后完成实际的档位切换。本驱动的注入 IOCTL 在内核里复刻这
-一通知，**这是唯一的模式变更路径**——用户态从不写 DYTC：
+驱动亦可经 `package.cmd` 打成 INF 驱动包(`package\` 目录),`pnputil /add-driver package\PowerDash.inf /install` 安装为常驻服务。
 
-```
-AcpiVpc devext: mode2 计数器(+0xEC)=1、KeSetEvent 命名事件(+0x58)
-  与全部 mode2 注册私有事件（驱动镜像 RVA 0x7C80 数组）
-= FnHotkeyUtility 弹 OSD + Dispatcher 推进档位（实测与真实 Fn+Q 一致）
-```
+## 支持状态
 
-偏移针对 `AcpiVpc.sys 15.11.30.11`
-（SHA256 `F589BB88137DED8BFEA1F2F741B51EF7F0BD27A4BE51A48978B91D0C29E936FE`，
-换版本需重新核对 `powerdash.c` 中的偏移表）。
-
-DYTC 档位只读查询（GET=0x2）：func=(raw>>8)&0xF，mode=(raw>>12)&0xF ——
-(0|5,0xF)=智能，(11,2)=高性能，(11,3)=节能。
-
-## 完整逆向档案
-
-全部接口逆向与实机验证记录见
-`EM-Driver/analysis/接口分析报告.md`（39 个 EnergyDrv IOCTL、DSDT 分析、
-事件架构、注入实验全记录）。
+- Intel:完整列集(RAPL/DTS/驻留/PLx/Limit Reasons,已实机验证)
+- AMD:MSR/SMN 域完整列组;SMU PMTable 协议已通(握手/版本/传输),深层字段(STAPM/TDC/SVI3/逐核温度等)待表布局映射后补列,期间该组列诚实输出空单元格
+- 模式切换仅支持 Lenovo(EnergyDrv/DYTC 通道);`-setpl` 仅 Intel(MCHBAR 路径)

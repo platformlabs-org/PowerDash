@@ -398,3 +398,6 @@ FodyWeavers.xsd
 *.sln.iml
 .worktrees/
 tests/build/
+
+# Session-level research/forensics staging area (not committed; evidence archive goes to NAS)
+.scratch/
